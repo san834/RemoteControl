@@ -1,10 +1,10 @@
-#define _WINSOCK_DEPRECATED_NO_WARNINGS
+#define _WINSOCK_DEPRECATED_NO_WARNINGS //告诉编译器我使用了被标记为废弃状态的老API函数，不要给我提示警告
 #include <stdio.h>
 #include<Windows.h> //window编程
 #include<atlimage.h> //提供轻量级的位图/DIB 加载、显示、保存能力
 
 #pragma comment(lib,"ws2_32.lib") //链接库
-#define RECV_BUFFER_SIZE 1024 * 1024 * 10  //1MB
+#define RECV_BUFFER_SIZE (1024 * 1024 * 10) //10MB缓冲
 
 //将这个结构体按照1字节对齐  这样就不会有内存对齐的填充字节  结构体的大小就是成员变量的大小之和
 #pragma pack(push,1)
@@ -14,14 +14,16 @@ struct PacketHeader
 	int cmd;   //4字节命令号
 	int body_len; //数据长度
 };
-#pragma pack(pop) 
+#pragma pack(pop) //保证只影响PacketHeader结构体  不污染后面的代码
 
 struct Packet
 {
 	PacketHeader header; //包头
-	char body[]; //包体
+	char body[]; //包体  柔性数组  不占结构体大小  需要动态分配内存  body 指向 header 之后的内存
 };
 
+
+//暗号表
 //鼠标信息  按键：右键、左键、中间   状态：按下、放开、双击
 enum ENUM_MOUSE{
 	MOUSE_MOVE = 1, //鼠标移动
@@ -50,9 +52,6 @@ struct KeyBoard {
 	int key_status;//按下/放开
 };
 
-
-
-
 //方便定义整数常量
 enum CMD
 {
@@ -75,29 +74,31 @@ int HandleKeyBoard(Packet* packet);
 int HandleTestConnect(Packet* packet);
 
 
-SOCKET g_server_socket;
-SOCKET g_client_socket;
+SOCKET g_server_socket;  //监听套接字  用于等待客户端连接
+SOCKET g_client_socket;  //客户端套接字  用于和客户端通信
 
-unsigned long g_screen_thread_id = 0;
+unsigned long g_screen_thread_id = 0;  // 三个工作线程的 ID，用于 PostThreadMessage  收件地址
 unsigned long g_mouse_thread_id = 0;
 unsigned long g_keyboard_thread_id = 0;
 
+//自定义消息  WM_USER 以上留给应用
 #define WM_HANDLE_SCREEN (WM_USER + 1)
 #define WM_HANDLE_MOUSE (WM_USER + 2)
 #define WM_HANDLE_KEYBOARD (WM_USER + 3)
-#define WM_HANDLE_INVOKE_MSG_LOOP (WM_USER + 4)
+#define WM_HANDLE_INVOKE_MSG_LOOP (WM_USER + 4)  //专门用来"激活"消息队列的空消息
 
+//DWORD:Double Word 32位无符号整数  WINAPI:调用约定
 DWORD WINAPI HandleScreenThreadFuc(LPVOID lpThreadParameter)
 {
-	//第一次往线程里面post数据是收不到的，需要提前post一个消息，消息队列未启动
+	//主线程 CreateThread 后立即 PostThreadMessage 时线程可能还没执行到 GetMessage，消息会丢。 Sleep(100) 兜底
 	MSG msg;
-	while (GetMessage(&msg,0,0,0))//等待消息
-	{
+	while (GetMessage(&msg, 0, 0, 0))//阻塞等待消息  收到返回非0进入循环  WM_QUIT返回0  
+	{//每个线程有自己的消息队列，靠 thread_id 定位
 		if (msg.message == WM_HANDLE_SCREEN)
 		{
-			Packet* packet = (Packet*) msg.lParam;
-			HandleScreen(packet);
-			free(packet);
+			Packet* packet = (Packet*) msg.lParam;  // 主线程把 Packet* 塞在 lParam 里传过来  lParam传指针
+			HandleScreen(packet);  //真正干活的函数
+			free(packet);  //释放内存
 		}
 	}
 	return 0;
@@ -179,6 +180,7 @@ int main()
 		else
 		{
 			printf("接收数据失败！\n");
+			break;
 
 		}
 
@@ -190,18 +192,14 @@ int main()
 			Packet* packet = ParsePacket(buffer, index); // 解析数据
 			while (packet != NULL && index > 0)
 			{
-				if (packet == NULL)
-				{
-					printf("解析数据失败！\n");
-				}
+				
 				printf("解析数据成功！\n");
-				if (packet != NULL)
-				{
-					index -= GetPacketLen(packet);
-					memmove(buffer, buffer + GetPacketLen(packet), index);
+				
+				index -= GetPacketLen(packet);
+				memmove(buffer, buffer + GetPacketLen(packet), index);
 
-					HandleCommand(packet);//处理命令
-				}
+				HandleCommand(packet);//处理命令
+				
 				packet = ParsePacket(buffer, index);
 			}
 		}
@@ -218,7 +216,7 @@ int main()
 
 int HandleCommand(Packet* packet)
 {
-	printf("Handle cmd:\r\n",packet->header.body_len);
+	printf("Handle cmd:%d\r\n",packet->header.body_len);
 	int ret = 0;
 	switch (packet->header.cmd)
 	{
@@ -509,9 +507,9 @@ int InitServer()
 	//3.给服务器socket绑定地址
 	SOCKADDR_IN server_addr;
 	server_addr.sin_family = AF_INET; //协议族 ipv4协议
-	server_addr.sin_port = ntohs(9999); //端口号  0-1024 ntohs函数将主机字节序转换为网络字节序
-	//server_addr.sin_addr.S_un.S_addr = inet_addr("192.168.3.46"); //IP地址  0.0.0.0 监听服务器上所有的ip  INADDR_ANY:本地所有IP地址
-	server_addr.sin_addr.S_un.S_addr = INADDR_ANY("0.0.0.0"); //IP地址  0.0.0.0 监听服务器上所有的ip  INADDR_ANY:本地所有IP地址
+	server_addr.sin_port = htons(9999); //端口号  0-1024 htons函数将主机字节序转换为网络字节序
+	//server_addr.sin_addr.S_un.S_addr = inet_addr(""); //IP地址  0.0.0.0 监听服务器上所有的ip  INADDR_ANY:本地所有IP地址
+	server_addr.sin_addr.S_un.S_addr = inet_addr("0.0.0.0"); //IP地址  0.0.0.0 监听服务器上所有的ip  INADDR_ANY:本地所有IP地址
 	if (bind(g_server_socket, (SOCKADDR*)&server_addr, sizeof(server_addr)) == SOCKET_ERROR)
 	{
 		printf("绑定地址失败！\n");
