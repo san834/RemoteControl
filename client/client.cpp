@@ -123,20 +123,24 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	}
 		break;
 
-	case WM_MOUSEMOVE://鼠标移动  一秒发一次请求
+	case WM_MOUSEMOVE:
 	{
-		//拿到了当前鼠标位置
-		int xPos = LOWORD(lParam); //低两个字节是x坐标
-		int yPos = HIWORD(lParam); //高两个字节是y坐标
+		// 节流：距上次发送不足 16ms 就直接忽略这次移动
+		if (GetTickCount64() - mouse_tick < 16)
+			break;
+
+		int xPos = LOWORD(lParam);
+		int yPos = HIWORD(lParam);
 		RECT client_rect;
-		GetClientRect(hwnd,&client_rect);
+		GetClientRect(hwnd, &client_rect);
 		int client_width = client_rect.right - client_rect.left;
 		int client_height = client_rect.bottom - client_rect.top;
+
 		if (g_remote_width != -1 && g_remote_height != -1)
 		{
 			int rxPos = xPos * g_remote_width / client_width;
 			int ryPos = yPos * g_remote_height / client_height;
-			//发送数据
+
 			Mouse mouse;
 			mouse.action = MOUSE_MOVE;
 			mouse.ptXY.x = rxPos;
@@ -144,20 +148,11 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			Packet* packet = PackPacket(CMD_MOUSE, (char*)&mouse.action, sizeof(Mouse));
 			send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
 			free(packet);
-			mouse_tick = GetTickCount64();
-			/*
-			if (GetTickCount64() - mouse_tick > 500)
-			{
-				Packet* packet = PackPacket(CMD_MOUSE, (char*)&mouse.action, sizeof(Mouse));
-				send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
-				free(packet);
-				mouse_tick = GetTickCount64();
-			}*/
 
+			mouse_tick = GetTickCount64();   // 更新"上次发送时刻"
 		}
-
 	}
-		break;
+	break;
 
 	case WM_LBUTTONDOWN://鼠标左键按下
 	{
@@ -404,11 +399,23 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		KeyBoard key_board;
 		key_board.virtual_code = wParam;
 		key_board.key_status = 0;
-		Packet* packet = PackPacket(CMD_KEYBOARD, (char*) & key_board.virtual_code, sizeof(KeyBoard));
+		Packet* packet = PackPacket(CMD_KEYBOARD, (char*) & key_board, sizeof(KeyBoard));
 		send(g_server_socket, (char*)& packet->header.magic, GetPacketLen(packet), 0);
 		free(packet);
 	}
 		break;
+
+	case WM_KEYUP:
+	case WM_SYSKEYUP:
+	{
+		KeyBoard key_board;
+		key_board.virtual_code = wParam;
+		key_board.key_status = KEYEVENTF_KEYUP;   // 抬起
+		Packet* packet = PackPacket(CMD_KEYBOARD, (char*)&key_board, sizeof(KeyBoard));
+		send(g_server_socket, (char*)&packet->header.magic, GetPacketLen(packet), 0);
+		free(packet);
+	}
+	break;
 
 
 	default:
@@ -420,79 +427,74 @@ LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 }
 
 //返回值 调用约定 函数名(参数列表){函数体}
-DWORD WINAPI SendScreenCallBack(LPVOID lpThreadParameter)
+DWORD WINAPI SendScreenCallBack(LPVOID)
 {
 	char* recv_buffer = (char*)malloc(RECV_BUFFER_SIZE);
-	//不停的发送屏幕数据和解析数据
+	int index = 0;
+	bool need_request = true;      // 是否需要发一次屏幕请求
+
 	while (true)
 	{
-		Packet* pck = PackPacket(CMD_SCREEN, NULL, 0);
-		//发送获取屏幕请求
-		int sen_len = send(g_server_socket, (char*)&pck->header.magic, GetPacketLen(pck),0);
-		if (sen_len > 0)
+		// 缓冲里没有待处理数据时，才发新的屏幕请求
+		if (need_request)
 		{
-			OutputDebugString("发送请求屏幕数据成功！\n");
-
+			Packet* pck = PackPacket(CMD_SCREEN, NULL, 0);
+			send(g_server_socket, (char*)&pck->header.magic, GetPacketLen(pck), 0);
+			free(pck);
+			need_request = false;
 		}
-		else
+
+		if (index >= RECV_BUFFER_SIZE) { index = 0; }   // 兜底
+
+		int len = recv(g_server_socket, recv_buffer + index, RECV_BUFFER_SIZE - index, 0);
+		if (len <= 0) break;          // 断连/出错，退出线程
+		index += len;
+
+		Packet* recv_pck = ParsePacket(recv_buffer, index);
+		while (recv_pck != NULL)
 		{
-			OutputDebugString("发送请求屏幕数据失败！\n");
-		}
-		free(pck);
+			int pktLen = GetPacketLen(recv_pck);
+			index -= pktLen;
+			memmove(recv_buffer, recv_buffer + pktLen, index);
 
-		//等待接收数据
-		int len = recv(g_server_socket,recv_buffer, RECV_BUFFER_SIZE,0);
-		if (len > 0)
-		{
-			Packet* recv_pck = ParsePacket(recv_buffer, len);
-			if (recv_pck != NULL)
-			{//解析成功
-
-				//处理数据 拿到了屏幕数据
-				//绘制屏幕数据
-				HGLOBAL hMen =  GlobalAlloc(GMEM_MOVEABLE, 0);
-				if (hMen == NULL)  continue;
-
+			// ---- 处理这一帧屏幕 ----
+			HGLOBAL hMen = GlobalAlloc(GMEM_MOVEABLE, 0);
+			if (hMen)
+			{
 				IStream* pStream = NULL;
-				HRESULT ret = CreateStreamOnHGlobal(hMen, true, &pStream);
-				if (ret == S_OK)
+				if (CreateStreamOnHGlobal(hMen, true, &pStream) == S_OK)
 				{
-					ULONG length = 0;
-					pStream->Write(recv_pck->body, recv_pck->header.body_len, &length);
-					free(recv_pck);
-
-
-					//将流指针放到开头  STREAM_SEEK_SET:开头
+					ULONG written = 0;
+					pStream->Write(recv_pck->body, recv_pck->header.body_len, &written);
 					LARGE_INTEGER lg = { 0 };
 					pStream->Seek(lg, STREAM_SEEK_SET, NULL);
 
 					EnterCriticalSection(&g_cri_sec);
-					//将数据移到缓存里面去
-					if (!g_image.IsNull())
-					{
-						g_image.Destroy();
-					}
+					if (!g_image.IsNull()) g_image.Destroy();
 					g_image.Load(pStream);
-					if (g_remote_width == -1 && g_remote_height == -1)
-					{
+					if (g_remote_width == -1 && g_remote_height == -1) {
 						g_remote_width = g_image.GetWidth();
 						g_remote_height = g_image.GetHeight();
 					}
-
 					LeaveCriticalSection(&g_cri_sec);
 
-
-					//更新图片——将图片画到窗口上，所有和UI相关的操作不能在非UI流水线（线程）操作
-					//通知UI线程重绘窗口
-					InvalidateRect(g_hwnd, NULL, FALSE);
-					UpdateWindow(g_hwnd);
-
+					InvalidateRect(g_hwnd, NULL, FALSE);   // 只 Invalid 不 Update
+					pStream->Release();                     // ★ 别忘了 Release
+				}
+				else
+				{
+					GlobalFree(hMen);                       // 流没接管，自己释放
 				}
 			}
+
+			free(recv_pck);
+			recv_pck = ParsePacket(recv_buffer, index);
 		}
 
-
+		need_request = true;     // 这一批处理完，发下一帧请求
 	}
+	free(recv_buffer);
+	return 0;
 }
 
 
@@ -586,76 +588,10 @@ int InitWindow(HINSTANCE hInstance, int nCmdShow)
 }
 
 
-/*main函数是控制台的入口
-int main()
-{
-
-
-
-
-	getchar();
-	//2.连接服务器
-	if (connect(g_server_socket, (SOCKADDR*)&g_server_addr, sizeof(g_server_addr)) == SOCKET_ERROR)
-	{
-		printf("连接服务器失败！\n");
-		return -1;
-	}
-	printf("连接服务器成功！\n");
-
-	//3.发送数据给服务器
-	char buffer[1024] = "Hello, Server!";
-	char* recv_buffer  = (char*) malloc(RECV_BUFFER_SIZE);
-
-	int count = 0;
-
-	while (true)
-	{
-		count++;
-		//sprintf_s(buffer, "packet: %d", count);
-		//sprintf(buffer, "packet: %d", count);
-		printf("请输入要发送的数据：");
-		fgets(buffer, 1024, stdin);//接收用户输入
-
-
-		Packet* send_packet = PackPacket(2000, buffer, 10);
-		send(g_server_socket, (char*)&send_packet->header.magic, send_packet->header.body_len + sizeof(PacketHeader), 0); //发送数据给服务器
-		free(send_packet);
-
-
-		printf("发送数据给服务器：%s\n", buffer);
-
-		//4.等待服务器发送数据
-		int len = recv(g_server_socket, recv_buffer, RECV_BUFFER_SIZE, 0);
-		if (len > 0)
-		{
-			Packet* recv_pck = ParsePacket(recv_buffer, len);
-			printf("收到服务端数据packet->body：%s\n", recv_pck->body);
-			printf("收到服务端数据packet->header.magic：%x\n", recv_pck->header.magic);
-			printf("收到服务端数据packet->header.cmd：%d\n", recv_pck->header.cmd);
-			printf("收到服务端数据packet->header.body_len：%d\n", recv_pck->header.body_len);
-			if (recv_pck->header.cmd == 1)
-			{
-				//服务器返回了屏幕数据
-				//解析显示数据
-
-			}
-
-			free(recv_pck);
-		}
-	}
-
-
-	closesocket(g_server_socket); //关闭socket
-	WSACleanup();
-
-	return 0;
-
-}
-*/
-
 Packet* PackPacket(int cmd, char* buffer, int buffer_len)
 {
 	Packet* pck = (Packet*)malloc(sizeof(PacketHeader) + buffer_len);
+	if (pck == NULL) return NULL;
 	pck->header.magic = 0x12345678; //包头
 	pck->header.cmd = cmd; //命令号
 	pck->header.body_len = buffer_len;//数据长度
@@ -671,41 +607,44 @@ Packet* PackPacket(int cmd, char* buffer, int buffer_len)
 
 Packet* ParsePacket(char* buffer, int len)
 {
-	Packet pck;
-	Packet* ppck;
+	if (len < (int)sizeof(PacketHeader))   // 连头都不够，等下次
+		return NULL;
+
 	int index = 0;
-	for (; index < len; index++)
+	// 安全扫描 magic：保证 index+4 <= len，不越界
+	for (; index + 4 <= len; index++)
 	{
-		//找包头
 		if (*(int*)(buffer + index) == 0x12345678)
-		{
-			pck.header.magic = *(int*)(buffer + index);
-			index += 4;
 			break;
-		}
 	}
+	if (index + 4 > len)                   // 没找到 magic
+		return NULL;
 
-	pck.header.cmd = *(int*)(buffer + index);
-	index += 4;
+	int magic = *(int*)(buffer + index);   index += 4;
+	if (index + 8 > len)                   // cmd / body_len 还没收全
+		return NULL;
 
-	pck.header.body_len = *(int*)(buffer + index);
-	index += 4;
+	int cmd = *(int*)(buffer + index); index += 4;
+	int body_len = *(int*)(buffer + index); index += 4;
 
-	//获取数据
-	if (pck.header.body_len > 0)
-	{
-		//创建接受缓冲区
-		ppck = (Packet*)malloc(sizeof(PacketHeader) + pck.header.body_len);
+	if (body_len < 0)                      // 非法长度
+		return NULL;
+	if (index + body_len > len)            // 半包，等下次 recv 补齐
+		return NULL;
 
-		//拷贝用户数据
-		memcpy(ppck->body, buffer + index, pck.header.body_len);
+	Packet* ppck = (Packet*)malloc(sizeof(PacketHeader) + body_len);
+	if (ppck == NULL)
+		return NULL;
 
-		//拷贝包头
-		memcpy(&ppck->header, &pck.header, sizeof(PacketHeader));
+	ppck->header.magic = magic;
+	ppck->header.cmd = cmd;
+	ppck->header.body_len = body_len;
 
-		return ppck;
-	}
+	memcpy(ppck->body, buffer + index, body_len);
+
+	return ppck;
 }
+
 
 int InitSocket()
 {
@@ -722,9 +661,10 @@ int InitSocket()
 	}
 
 	g_server_addr.sin_family = AF_INET;
-	g_server_addr.sin_port = ntohs(9999); //转换为网络字节序
+	g_server_addr.sin_port = htons(9999); //转换为网络字节序
 
 	g_server_addr.sin_addr.S_un.S_addr = inet_addr("192.168.150.129");
+	return 0;
 }
 
 

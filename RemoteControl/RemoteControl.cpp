@@ -137,6 +137,7 @@ DWORD WINAPI HandleKeyBoardThreadFuc(LPVOID lpThreadParameter)
 //服务端
 int main()
 {
+	SetProcessDPIAware();//设置当前进程的DPI感知上下文  DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2:每个显示器都具有独立的DPI感知能力 适用于多显示器环境
 	if (InitServer() != 0)
 	{
 		printf("启动服务失败！\n");
@@ -172,6 +173,12 @@ int main()
 	while (true)//循环接受数据
 	{
 
+		if (index >= RECV_BUFFER_SIZE)
+		{
+			printf("接收缓冲区已满，可能收到大量无效数据，退出。\n");
+			break;
+		}
+
 		int len = recv(g_client_socket, buffer + index, RECV_BUFFER_SIZE - index, 0); //等待客户端发送数据  阻塞函数
 		if (len > 0) {
 			index += len;
@@ -179,7 +186,7 @@ int main()
 		}
 		else
 		{
-			printf("接收数据失败！\n");
+			
 			break;
 
 		}
@@ -223,25 +230,36 @@ int HandleCommand(Packet* packet)
 
 	case CMD_SCREEN://发送屏幕命令
 		//向线程投递消息是异步的，瞬间执行不阻塞
-		PostThreadMessage(g_screen_thread_id,WM_HANDLE_SCREEN,NULL,(LPARAM)packet);
+		if(!PostThreadMessage(g_screen_thread_id,WM_HANDLE_SCREEN,NULL,(LPARAM)packet))
+		{
+			free(packet);
+		}
 		//ret = HandleScreen(packet);
 		break;
 
 	case CMD_MOUSE://鼠标事件
-		PostThreadMessage(g_mouse_thread_id, WM_HANDLE_MOUSE, NULL, (LPARAM)packet);
+		if(!PostThreadMessage(g_mouse_thread_id, WM_HANDLE_MOUSE, NULL, (LPARAM)packet))
+		{
+			free(packet);
+		}
 		//ret = HandleMouse(packet);
 		break;
 
 	case CMD_KEYBOARD://键盘命令
-		PostThreadMessage(g_keyboard_thread_id, WM_HANDLE_KEYBOARD, NULL, (LPARAM)packet);
+		if(!PostThreadMessage(g_keyboard_thread_id, WM_HANDLE_KEYBOARD, NULL, (LPARAM)packet))
+		{
+			free(packet);
+		}
 		//ret = HandleKeyBoard(packet);
 		break;
 	
 	case CMD_TESTCONNECT://测试连接命令
 		ret = HandleTestConnect(packet);
+		free(packet);
 		break;
 
 	default:
+		free(packet);
 		break;
 	}
 
@@ -254,12 +272,12 @@ int HandleScreen(Packet* packet)
 
 	CImage image;//创建一个image对象
 
-	HDC hScreen = GetDC(NULL);//获取屏幕DC
+	HDC hScreen = GetDC(NULL);//获取屏幕DC  NULL=整个屏幕
 
 	int bitWidth = GetDeviceCaps(hScreen, BITSPIXEL);//获取屏幕的位宽
 	printf("bitWidth: %d\n", bitWidth);
 	
-	SetProcessDPIAware();//设置当前进程的DPI感知上下文  DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2:每个显示器都具有独立的DPI感知能力 适用于多显示器环境
+	
 
 
 	int sWidth = GetSystemMetrics(SM_CXSCREEN);//获取屏幕宽度
@@ -274,7 +292,7 @@ int HandleScreen(Packet* packet)
 
 	//转为网络流
 	//image.Save("test.png",::Gdiplus::ImageFormatPNG);
-	HGLOBAL hMen = GlobalAlloc(GMEM_MOVEABLE, 0);//从堆上申请一块可变的内存
+	HGLOBAL hMen = GlobalAlloc(GMEM_MOVEABLE, 0);//分配一个可移动的全局内存块（初始0字节）
 	if (hMen == NULL)
 	{
 		//申请内存失败
@@ -284,39 +302,58 @@ int HandleScreen(Packet* packet)
 	//创建一个内存流
 	IStream* pStream = NULL;
 	HRESULT ret =  CreateStreamOnHGlobal(hMen, true, &pStream);
-	if (ret == S_OK)
+	if (ret != S_OK) {
+		GlobalFree(hMen);          // 创建流失败，流没接管 hMen，自己释放
+		return -1;                 // 直接返回（此时也无需再 Release pStream，它是 NULL）
+	}
+	
+	//将文件保留在内存流里面  png格式
+	image.Save(pStream, ::Gdiplus::ImageFormatPNG);
+	//将流指针放到开头  STREAM_SEEK_SET:开头
+	LARGE_INTEGER lg = { 0 };
+	pStream->Seek(lg, STREAM_SEEK_SET, NULL);
+
+	//获取流指针
+	char* pdata = (char*)GlobalLock(hMen);
+	//获取长度
+	int len = GlobalSize(hMen);
+
+	// ---- 发送数据（循环发送，处理部分发送）----
+	Packet* pck = PackPacket(CMD_SCREEN, pdata, len);
+	if (pck == NULL)
 	{
-		//将文件保留在内存流里面
-		image.Save(pStream, ::Gdiplus::ImageFormatPNG);
-		//将流指针放到开头  STREAM_SEEK_SET:开头
-		LARGE_INTEGER lg = { 0 };
-		pStream->Seek(lg, STREAM_SEEK_SET, NULL);
-
-		//获取流指针
-		char* pdata = (char*)GlobalLock(hMen);
-		//获取长度
-		int len = GlobalSize(hMen);
-
-		//发送数据
-		Packet* pck = PackPacket(CMD_SCREEN, pdata, len);
-		int send_len = send(g_client_socket, (char*) & pck->header.magic, sizeof(PacketHeader) + len, 0);
-		if (send_len > 0)
-		{
-			printf("发送成功:%d\r\n",send_len);
-		}
-		else if(send_len < 1)
-		{
-			printf("发送失败:%d\r\n", send_len);
-		}
-
-		free(pck);
-
-		GlobalUnlock(hMen);//解锁内存
+		printf("打包失败\r\n");
+		GlobalUnlock(hMen);
+		pStream->Release();
+		image.Destroy();
+		return -1;
 	}
 
+	int total = sizeof(PacketHeader) + len;   // 整个包的总字节数
+	int sent = 0;                             // 已发送字节数
+	char* p = (char*)&pck->header.magic;      // 从 magic 开始，即包头第一个字节
 
-	pStream->Release();//释放流对象
-	image.ReleaseDC();//释放图像对象的DC
+	while (sent < total)
+	{
+		int n = send(g_client_socket, p + sent, total - sent, 0);
+		if (n <= 0)
+		{
+			printf("发送失败:%d\r\n", n);
+			break;
+		}
+		sent += n;
+	}
+
+	if (sent == total)
+		printf("发送成功:%d\r\n", sent);
+
+	free(pck);
+	GlobalUnlock(hMen);
+	
+
+
+	if (pStream) pStream->Release();//释放流对象
+	image.Destroy();//释放图像对象的DC
 
 	//通过网络发送
 	return 0;
@@ -326,7 +363,8 @@ int HandleMouse(Packet* packet)
 {
 	//取出鼠标信息
 	Mouse mouse;
-	memcpy(&mouse.action, packet->body, packet->header.body_len);
+	memset(&mouse, 0, sizeof(mouse));   // 先清零，防止 body 不足时读到垃圾坐标
+	memcpy(&mouse, packet->body, min(packet->header.body_len, sizeof(Mouse)));
 	printf("x = %d, y = %d", mouse.ptXY.x, mouse.ptXY.y);
 
 	// 模拟执行鼠标事件
@@ -336,7 +374,6 @@ int HandleMouse(Packet* packet)
 	switch (mouse.action)
 	{
 	case MOUSE_MOVE:
-		SetCursorPos(mouse.ptXY.x, mouse.ptXY.y);
 		break;
 	case MOUSE_LDOWN:
 		mouse_event(MOUSEEVENTF_LEFTDOWN,0,0,0,GetMessageExtraInfo());
@@ -388,7 +425,10 @@ int HandleMouse(Packet* packet)
 int HandleKeyBoard(Packet* packet)
 {
 	KeyBoard key_board;
-	memcpy(&key_board.virtual_code, packet->body, packet->header.body_len);
+	if (packet->header.body_len >= (int)sizeof(KeyBoard))
+		memcpy(&key_board, packet->body, sizeof(KeyBoard));
+	else
+		return -1;
 
 	INPUT input = { 0 };
 	input.type = INPUT_KEYBOARD;
@@ -410,58 +450,48 @@ int HandleKeyBoard(Packet* packet)
 
 int HandleTestConnect(Packet* packet)
 {
-
+	
 	return 0;
 }
 
 Packet* ParsePacket(char* buffer, int len)
 {
-	Packet pck;
-	Packet* ppck = nullptr;
+	if (len < (int)sizeof(PacketHeader))   // 连头都不够，等下次
+		return NULL;
+
 	int index = 0;
-	for (; index < len; index++)
+	// 安全扫描 magic：保证 index+4 <= len，不越界
+	for (; index + 4 <= len; index++)
 	{
-		//找包头
 		if (*(int*)(buffer + index) == 0x12345678)
-		{
-			pck.header.magic = *(int*)(buffer + index);
-			index += 4;
 			break;
-		}
 	}
+	if (index + 4 > len)                   // 没找到 magic
+		return NULL;
 
-	pck.header.cmd = *(int*)(buffer + index);
-	index += 4;
+	int magic = *(int*)(buffer + index);   index += 4;
+	if (index + 8 > len)                   // cmd / body_len 还没收全
+		return NULL;
 
-	pck.header.body_len = *(int*)(buffer + index);
-	index += 4;
+	int cmd = *(int*)(buffer + index); index += 4;
+	int body_len = *(int*)(buffer + index); index += 4;
 
+	if (body_len < 0)                      // 非法长度
+		return NULL;
+	if (index + body_len > len)            // 半包，等下次 recv 补齐
+		return NULL;
 
+	Packet* ppck = (Packet*)malloc(sizeof(PacketHeader) + body_len);
+	if (ppck == NULL)
+		return NULL;
 
-	//获取数据
-	if (pck.header.body_len == 0)
-	{//单纯的命令
-		ppck = (Packet*)malloc(sizeof(PacketHeader));
-		//拷贝包头
-		memcpy(&ppck->header, &pck.header, sizeof(PacketHeader));
+	ppck->header.magic = magic;
+	ppck->header.cmd = cmd;
+	ppck->header.body_len = body_len;
+	
+	memcpy(ppck->body, buffer + index, body_len);
 
-		return ppck;
-	}
-	if (pck.header.body_len > 0)
-	{
-		//创建接受缓冲区
-		ppck = (Packet*)malloc(sizeof(PacketHeader) + pck.header.body_len);
-
-		//拷贝用户数据
-		memcpy(ppck->body, buffer + index, pck.header.body_len);
-
-		//拷贝包头
-		memcpy(&ppck->header, &pck.header, sizeof(PacketHeader));
-
-		return ppck;
-	}
-
-	return NULL;
+	return ppck;
 }
 
 int GetPacketLen(Packet* pck)
