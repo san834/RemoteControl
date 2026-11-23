@@ -1,0 +1,44 @@
+name: build
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        config: [Release, Debug]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 配置（CMake + MSVC）
+        run: cmake -S . -B build -A x64
+
+      - name: 构建
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+
+      - name: 单元测试
+        run: ctest --test-dir build -C ${{ matrix.config }} --output-on-failure
+
+      # 基准只在 Release 跑，输出直接进构建摘要，便于和历史数据对比。
+      - name: 编码基准
+        if: matrix.config == 'Release'
+        run: |
+          ./build/Release/rc_bench.exe | Tee-Object -FilePath bench.txt
+          Get-Content bench.txt | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+      - name: 上传可执行文件
+        if: matrix.config == 'Release'
+        uses: actions/upload-artifact@v4
+        with:
+          name: remotecontrol-windows-x64
+          path: |
+            build/Release/rc_server.exe
+            build/Release/rc_client.exe
+          if-no-files-found: error
