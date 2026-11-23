@@ -1,32 +1,42 @@
-# Visual Studio
+# ---- 构建产物 ----
+build/
+dist/
+out/
+cmake-build-*/
+CMakeUserPresets.json
+
+# ---- Visual Studio ----
 .vs/
-*.suo
 *.user
+*.suo
+*.sln
 *.slnx
+*.vcxproj
 *.vcxproj.filters
 *.FileListAbsolute.txt
-
-# Build outputs
-x64/
-*/x64/
-
-# VS logs and intermediates
 *.tlog/
 *.ipch/
-*.iobj/
-*.ipdb/
+*.iobj
+*.ipdb
 *.obj
 *.pdb
 *.ilk
+*.exp
 *.recipe
 *.log
-!README.md
 
-# Test artifacts
-test.png
+# ---- 运行期日志 ----
+rc_client.log
+rc_server.log
+capture-logs/
 
-# IDE
+# ---- 编辑器 ----
 Browse.VC.db
 Solution.VC.db
 DocumentLayout.json
 DocumentLayout.backup.json
+.clangd/
+.cache/
+
+# docs 里的截图是要提交的，别被上面的规则误伤。
+!docs/*.png
