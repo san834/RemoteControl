@@ -30,6 +30,9 @@ rc_client.log
 rc_server.log
 capture-logs/
 
+# ---- 本地笔记（不入库）----
+notes/
+
 # ---- 编辑器 ----
 Browse.VC.db
 Solution.VC.db
