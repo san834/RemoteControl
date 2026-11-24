@@ -15,6 +15,7 @@
 
 #include "rc/compress.h"
 #include "rc/frame.h"
+#include "rc/log.h"
 
 namespace {
 
@@ -166,7 +167,7 @@ void PrintRow(const char* name, const TimedResult& result, double png_bytes) {
     const double bytes = result.avg_bytes();
     const double us = result.avg_us();
     const double ratio = png_bytes > 0 ? bytes / png_bytes * 100.0 : 100.0;
-    std::printf("| %-24s | %9.1f KB | %6.1f%% | %7.2f ms | %6.1f fps |\n", name,
+    rc::log::Print("| %-24s | %9.1f KB | %6.1f%% | %7.2f ms | %6.1f fps |\n", name,
                 bytes / 1024.0, ratio, us / 1000.0,
                 us > 0 ? 1000000.0 / us : 0.0);
 }
@@ -185,15 +186,15 @@ rc::FrameImage View(const std::vector<uint8_t>& pixels) {
 }  // namespace
 
 int main() {
-    std::printf("== rc_bench: %dx%d, %d 帧合成桌面 ==\n\n", kWidth, kHeight,
+    rc::log::Print("== rc_bench: %dx%d, %d 帧合成桌面 ==\n\n", kWidth, kHeight,
                 kFrames);
 
     const rc::Compression algorithm = rc::PreferredCompression();
     if (algorithm == rc::Compression::kNone) {
-        std::puts("当前系统缺少压缩 API（需要 Win8+），无法继续。");
+        rc::log::PrintLine("当前系统缺少压缩 API（需要 Win8+），无法继续。");
         return 1;
     }
-    std::printf("压缩算法: %s\n\n",
+    rc::log::Print("压缩算法: %s\n\n",
                 algorithm == rc::Compression::kXpressHuff ? "XPRESS_HUFF"
                                                           : "MSZIP");
 
@@ -211,7 +212,7 @@ int main() {
         std::size_t bytes = 0;
         double us = 0;
         if (!EncodePng(frame, &bytes, &us)) {
-            std::puts("PNG 编码失败（GDI+/ATL 不可用）");
+            rc::log::PrintLine("PNG 编码失败（GDI+/ATL 不可用）");
             return 2;
         }
         png.bytes += static_cast<double>(bytes);
@@ -273,17 +274,17 @@ int main() {
 
     const double png_avg = png.avg_bytes();
 
-    std::puts("| 方案 | 平均每帧 | 相对 PNG | 平均耗时 | 单核编码上限 |");
-    std::puts("|:--|--:|--:|--:|--:|");
+    rc::log::PrintLine("| 方案 | 平均每帧 | 相对 PNG | 平均耗时 | 单核编码上限 |");
+    rc::log::PrintLine("|:--|--:|--:|--:|--:|");
     PrintRow("整帧 PNG (v1)", png, png_avg);
     PrintRow("整帧 + 压缩（不差分）", raw_zip, png_avg);
     PrintRow("分块脏块 + 压缩 (v2)", delta_zip, png_avg);
-    std::printf("| %-24s | %6.0f B  | %6.3f%% | %7.3f ms | %6.0f fps |\n",
+    rc::log::Print("| %-24s | %6.0f B  | %6.3f%% | %7.3f ms | %6.0f fps |\n",
                 "静止画面 (v2)", idle.avg_bytes(), idle.avg_bytes() / png_avg * 100.0,
                 idle.avg_us() / 1000.0,
                 idle.avg_us() > 0 ? 1000000.0 / idle.avg_us() : 0.0);
 
-    std::printf(
+    rc::log::Print(
         "\nv2 耗时构成：差分 %.2f ms + 压缩 %.2f ms；平均脏块 %.1f / 510"
         "（%d×%d，分块 %u）。\n",
         diff_us / delta_zip.frames / 1000.0, zip_us / delta_zip.frames / 1000.0,
@@ -291,7 +292,7 @@ int main() {
         (kWidth + rc::kDefaultTileSize - 1) / rc::kDefaultTileSize,
         (kHeight + rc::kDefaultTileSize - 1) / rc::kDefaultTileSize,
         rc::kDefaultTileSize);
-    std::puts(
+    rc::log::PrintLine(
         "单核编码上限 = 1000 / 平均耗时，不含网络往返、捕获（BitBlt）与输入注入。");
     return 0;
 }

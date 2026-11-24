@@ -133,6 +133,28 @@ void Raw(const char* text) {
     EmitLocked(chunk);
 }
 
+void Print(const char* fmt, ...) {
+    if (!fmt) return;
+    char message[kMaxMessage];
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf_s(message, sizeof(message), _TRUNCATE, fmt, args);
+    va_end(args);
+
+    std::string line(message);
+    line += '\n';
+    std::lock_guard<std::mutex> lock(g_mutex);
+    EmitLocked(line);
+}
+
+void PrintLine(const char* text) {
+    if (!text) return;
+    std::string line(text);
+    line += '\n';
+    std::lock_guard<std::mutex> lock(g_mutex);
+    EmitLocked(line);
+}
+
 void Debug(const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);

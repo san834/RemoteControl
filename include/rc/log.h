@@ -20,6 +20,12 @@ void Write(Level level, const char* fmt, ...);
 // 原样输出、不加时间戳，用于 --help 这类多行文本。
 void Raw(const char* text);
 
+// 面向命令行工具（rc_bench / rc_tests）的输出：不带时间戳和级别前缀，
+// 但同样走 UTF-8 安全的控制台通道，直接用 printf 会乱码。
+void Print(const char* fmt, ...);
+// 纯文本一行（等价于 puts，不解析格式符）。
+void PrintLine(const char* text);
+
 void Debug(const char* fmt, ...);
 void Info(const char* fmt, ...);
 void Warn(const char* fmt, ...);

@@ -11,6 +11,7 @@
 #include "rc/compress.h"
 #include "rc/crc32.h"
 #include "rc/frame.h"
+#include "rc/log.h"
 #include "rc/stream.h"
 
 namespace {
@@ -22,7 +23,7 @@ int g_checks = 0;
     do {                                                                  \
         ++g_checks;                                                       \
         if (!(cond)) {                                                    \
-            std::printf("  [FAIL] %s:%d  %s\n", __FILE__, __LINE__, #cond); \
+            rc::log::Print("  [FAIL] %s:%d  %s\n", __FILE__, __LINE__, #cond); \
             ++g_failures;                                                 \
         }                                                                 \
     } while (0)
@@ -33,7 +34,7 @@ int g_checks = 0;
         const auto lhs = (a);                                                 \
         const auto rhs = (b);                                                 \
         if (!(lhs == rhs)) {                                                  \
-            std::printf("  [FAIL] %s:%d  %s == %s  (%lld vs %lld)\n",         \
+            rc::log::Print("  [FAIL] %s:%d  %s == %s  (%lld vs %lld)\n",         \
                         __FILE__, __LINE__, #a, #b,                           \
                         static_cast<long long>(lhs),                          \
                         static_cast<long long>(rhs));                         \
@@ -47,7 +48,7 @@ int g_checks = 0;
         const std::string lhs = (a);                                           \
         const std::string rhs = (b);                                           \
         if (lhs != rhs) {                                                      \
-            std::printf("  [FAIL] %s:%d  %s == %s  (\"%s\" vs \"%s\")\n",       \
+            rc::log::Print("  [FAIL] %s:%d  %s == %s  (\"%s\" vs \"%s\")\n",       \
                         __FILE__, __LINE__, #a, #b, lhs.c_str(), rhs.c_str()); \
             ++g_failures;                                                      \
         }                                                                      \
@@ -57,7 +58,7 @@ int g_checks = 0;
 // CRC32
 // ---------------------------------------------------------------------------
 void TestCrc32() {
-    std::puts("Crc32");
+    rc::log::PrintLine("Crc32");
     const char* text = "123456789";
     // IEEE 802.3 标准校验值。
     CHECK_EQ(rc::Crc32(text, std::strlen(text)), 0xCBF43926u);
@@ -73,7 +74,7 @@ void TestCrc32() {
 // 流式解码
 // ---------------------------------------------------------------------------
 void TestEncodeDecodeRoundTrip() {
-    std::puts("Encode / Decode 往返");
+    rc::log::PrintLine("Encode / Decode 往返");
     rc::MouseBody mouse{};
     mouse.action = static_cast<uint8_t>(rc::MouseAction::kLeftDown);
     mouse.x = 1234;
@@ -100,7 +101,7 @@ void TestEncodeDecodeRoundTrip() {
 }
 
 void TestByteAtATime() {
-    std::puts("逐字节投递（最极端的半包）");
+    rc::log::PrintLine("逐字节投递（最极端的半包）");
     const std::vector<uint8_t> a = rc::Encode(rc::Cmd::kPing, 1, 0, nullptr, 0);
     const std::vector<uint8_t> b =
         rc::Encode(rc::Cmd::kFrameRequest, 2, 0, nullptr, 0);
@@ -122,7 +123,7 @@ void TestByteAtATime() {
 }
 
 void TestMultiplePacketsInOneChunk() {
-    std::puts("一次投递包含多个包（粘包）");
+    rc::log::PrintLine("一次投递包含多个包（粘包）");
     std::vector<uint8_t> stream;
     for (int i = 0; i < 5; ++i) {
         const std::vector<uint8_t> packet =
@@ -142,7 +143,7 @@ void TestMultiplePacketsInOneChunk() {
 }
 
 void TestResyncAfterGarbage() {
-    std::puts("脏数据前缀后重同步");
+    rc::log::PrintLine("脏数据前缀后重同步");
     std::vector<uint8_t> stream(37, 0xAA);  // 不含魔数的垃圾
     const std::vector<uint8_t> packet =
         rc::Encode(rc::Cmd::kPong, 9, 0, nullptr, 0);
@@ -157,7 +158,7 @@ void TestResyncAfterGarbage() {
 }
 
 void TestCrcMismatchRecovers() {
-    std::puts("包体损坏后丢弃单包并恢复");
+    rc::log::PrintLine("包体损坏后丢弃单包并恢复");
     std::vector<uint8_t> bad =
         rc::Encode(rc::Cmd::kMouse, 1, 0, "hello world", 11);
     bad[rc::kHeaderSize + 3] ^= 0xFF;  // 破坏包体
@@ -180,7 +181,7 @@ void TestCrcMismatchRecovers() {
 }
 
 void TestOversizedBodyRejected() {
-    std::puts("越界 body_len 被拒绝");
+    rc::log::PrintLine("越界 body_len 被拒绝");
     rc::Decoder decoder(1024);
 
     rc::PacketHeader header{};
@@ -226,7 +227,7 @@ rc::FrameImage View(const std::vector<uint8_t>& pixels, int width, int height) {
 }
 
 void TestFirstFrameIsKeyFrame() {
-    std::puts("首帧必须是关键帧");
+    rc::log::PrintLine("首帧必须是关键帧");
     const int w = 200;
     const int h = 130;
     auto pixels = MakeFrame(w, h, 0);
@@ -240,7 +241,7 @@ void TestFirstFrameIsKeyFrame() {
 }
 
 void TestUnchangedFrameHasNoTiles() {
-    std::puts("画面静止 → 零脏块");
+    rc::log::PrintLine("画面静止 → 零脏块");
     const int w = 128;
     const int h = 128;
     auto pixels = MakeFrame(w, h, 7);
@@ -255,7 +256,7 @@ void TestUnchangedFrameHasNoTiles() {
 }
 
 void TestSingleTileChange() {
-    std::puts("单像素变化 → 只有 1 个脏块");
+    rc::log::PrintLine("单像素变化 → 只有 1 个脏块");
     const int w = 200;
     const int h = 130;
     auto pixels = MakeFrame(w, h, 3);
@@ -277,7 +278,7 @@ void TestSingleTileChange() {
 }
 
 void TestFrameRoundTrip() {
-    std::puts("编码 → 解码 → 像素完全一致");
+    rc::log::PrintLine("编码 → 解码 → 像素完全一致");
     const int w = 200;
     const int h = 130;
     auto pixels = MakeFrame(w, h, 11);
@@ -309,7 +310,7 @@ void TestFrameRoundTrip() {
 }
 
 void TestCorruptFrameRejected() {
-    std::puts("帧体被截断时拒绝解码");
+    rc::log::PrintLine("帧体被截断时拒绝解码");
     const int w = 128;
     const int h = 128;
     auto pixels = MakeFrame(w, h, 1);
@@ -336,9 +337,9 @@ void TestCompressionRoundTrip() {
                                           rc::Compression::kMsZip};
     for (const rc::Compression algorithm : algorithms) {
         const bool is_huff = algorithm == rc::Compression::kXpressHuff;
-        std::printf("%s 压缩往返\n", is_huff ? "XPRESS_HUFF" : "MSZIP");
+        rc::log::Print("%s 压缩往返\n", is_huff ? "XPRESS_HUFF" : "MSZIP");
         if (!rc::CompressionAvailable(algorithm)) {
-            std::puts("  [SKIP] 当前系统不支持该算法");
+            rc::log::PrintLine("  [SKIP] 当前系统不支持该算法");
             continue;
         }
 
@@ -364,7 +365,7 @@ void TestCompressionRoundTrip() {
 // 命令行
 // ---------------------------------------------------------------------------
 void TestCliArgs() {
-    std::puts("命令行解析");
+    rc::log::PrintLine("命令行解析");
     const char* argv[] = {"rc_server", "--port", "9998", "--verbose", "--token",
                           "secret"};
     rc::CliArgs args(6, const_cast<char**>(argv));
@@ -380,7 +381,7 @@ void TestCliArgs() {
 }  // namespace
 
 int main() {
-    std::puts("== RemoteControl 单元测试 ==");
+    rc::log::PrintLine("== RemoteControl 单元测试 ==");
     TestCrc32();
     TestEncodeDecodeRoundTrip();
     TestByteAtATime();
@@ -396,6 +397,6 @@ int main() {
     TestCompressionRoundTrip();
     TestCliArgs();
 
-    std::printf("\n共 %d 项断言，失败 %d 项\n", g_checks, g_failures);
+    rc::log::Print("\n共 %d 项断言，失败 %d 项\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
 }
