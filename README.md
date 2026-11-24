@@ -1,903 +1,519 @@
-# RemoteControl - 基于 C++/WinSock 的远程桌面控制系统
+# RemoteControl — 基于 C++20 / Win32 的局域网远程桌面
 
-## 项目运行展示
+自研二进制协议 + 分块脏矩形增量的屏幕传输，配合解耦的输入注入流水线。
 
-| 服务端（被控端） | 客户端（控制端） |
-|:---:|:---:|
-| ![服务端运行截图](servershow.gif) | ![客户端运行截图](clientshow.gif) |
+![客户端运行截图](docs/screenshot-client.png)
+
+> 实际部署形态：`rc_server` 跑在虚拟机里，`rc_client` 跑在宿主机，窗口标题栏是 VM 的 IP。窗口里显示的就是虚拟机的桌面，鼠标键盘实时转发过去。
 
 ---
 
 ## 目录
 
-- [1. 项目概述](#1-项目概述)
-- [2. 系统架构](#2-系统架构)
-- [3. 项目文件结构](#3-项目文件结构)
-- [4. 通信协议设计](#4-通信协议设计)
-- [5. 线程模型](#5-线程模型)
-- [6. 核心流程详解](#6-核心流程详解)
-  - [6.1 服务端流程](#61-服务端流程)
-  - [6.2 客户端流程](#62-客户端流程)
-  - [6.3 屏幕捕获与传输流程](#63-屏幕捕获与传输流程)
-  - [6.4 鼠标/键盘事件处理流程](#64-鼠标键盘事件处理流程)
-- [7. 关键技术点与 C++ 知识点](#7-关键技术点与-c-知识点)
-- [8. 构建与运行](#8-构建与运行)
-- [9. 待优化项](#9-待优化项)
+- [1. 这个项目解决什么问题](#1-这个项目解决什么问题)
+- [2. 关键设计](#2-关键设计)
+- [3. 架构](#3-架构)
+- [4. 协议设计](#4-协议设计)
+- [5. 帧编码：分块差分 + 压缩](#5-帧编码分块差分--压缩)
+- [6. 线程模型](#6-线程模型)
+- [7. 构建与运行](#7-构建与运行)
+- [8. 测试](#8-测试)
+- [9. 性能数据](#9-性能数据)
+- [10. 演示环境建议：服务端放虚拟机](#10-演示环境建议服务端放虚拟机)
+- [11. v1 → v2 修掉了什么](#11-v1--v2-修掉了什么)
+- [12. 已知限制与下一步](#12-已知限制与下一步)
+- [13. 目录结构](#13-目录结构)
 
 ---
 
-## 1. 项目概述
+## 1. 这个项目解决什么问题
 
-RemoteControl 是一个基于 **C++ Win32 API + WinSock2** 实现的局域网远程桌面控制系统。系统采用 **客户端/服务端（C/S）架构**：
+一个局域网内的远程桌面：服务端抓屏并把画面编码后发给客户端，客户端显示并把鼠标/键盘事件回传，服务端用 `SendInput` 重放。
 
-- **服务端（Server）**：运行在被控机器上，负责捕获屏幕图像、接收并模拟执行来自客户端的鼠标/键盘操作。
-- **客户端（Client）**：运行在控制端机器上，负责请求远程屏幕图像并实时显示、捕获本地鼠标/键盘事件并发送到服务端。
+第一版能跑通，但**每次请求都把整屏截下来编码成 PNG 再整包发送**——1080p 下每帧 300KB~2MB，帧率被"全屏 PNG 编码"卡死在个位数。第二版重做了传输模型和协议层：
 
-**核心特性：**
-- TCP 可靠传输
-- 自定义二进制通信协议（魔数校验 + 命令分发）
-- 多线程异步命令处理（屏幕/鼠标/键盘独立流水线）
-- 屏幕图像以 PNG 格式实时压缩传输
-- 支持鼠标移动、单击、双击、右键、中键全动作
-- 支持键盘按键模拟
-- 坐标自适应缩放（客户端窗口 → 远程屏幕）
-- 高 DPI 显示器适配
+| 指标（1920×1080 合成桌面，见第 9 节） | v1（整帧 PNG） | v2（分块差分 + 压缩） |
+|:--|--:|--:|
+| 平均每帧字节 | 1716 KB | **108 KB**（6.3%） |
+| 平均编码耗时 | 56.6 ms | **3.1 ms** |
+| 单核编码上限 | 17.7 fps | **322 fps** |
+| 画面完全静止时 | 一样贵 | **24 B/帧** |
+
+代价是代码量翻了几倍，以及必须自己处理流式解包、重同步、脏块边界和压缩算法协商。
 
 ---
 
-## 2. 系统架构
+## 2. 关键设计
 
-### 2.1 整体架构图
+- **流式协议状态机**，不是"扫描魔数"。包头定长 20 字节 + CRC32 校验，正常路径 O(1)，只有校验失败时才滑动重同步。半包、粘包、脏字节都是显式分支，有单元测试覆盖。
+- **分块脏矩形增量**：画面切成 64×64 块，逐块 `memcmp` 差分，只编码变化的块；上一帧缓冲只更新脏块，不整屏拷贝。
+- **压缩算法可切换**：`XPRESS_HUFF`（快）与 `MSZIP`（省带宽）都实测过，算法写进包头标志位，收端按标志位解压，两者互通，不做版本锁死。
+- **单一 socket 写入者**：所有出站数据都过一条队列，由发送线程独占写入；客户端 UI 线程只投递、从不碰 socket。
+- **按客户端窗口尺寸协商降采样**：把 2560×1600 的桌面原样传给 1024 宽的窗口，等于白传 6 倍像素。
+- **捕获与注入都是接口**（`IScreenCapture` / `IInputInjector`），换 DXGI 后端不需要动协议和会话层。
+
+---
+
+## 3. 架构
 
 ```mermaid
 graph TB
-    subgraph Client["客户端 Client (client.cpp)"]
-        A[WinMain 入口] --> B[InitWindow<br/>创建 Win32 窗口]
-        A --> C[InitSocket<br/>创建 TCP Socket]
-        C --> D[connect<br/>连接服务端 192.168.3.53:9999]
-        D --> E[CreateThread<br/>创建屏幕接收线程]
-        E --> F[SendScreenCallBack<br/>循环请求屏幕数据]
-        A --> G[GetMessage 消息循环]
-        G --> H[winProc 窗口过程]
-        
-        H -->|WM_PAINT| I[绘制远程屏幕图像<br/>CImage + StretchBlt]
-        H -->|WM_MOUSEMOVE/CLICK| J[捕获鼠标事件<br/>坐标缩放, 打包发送]
-        H -->|WM_KEYDOWN| K[捕获键盘事件<br/>虚拟键码, 打包发送]
-        
-        F -->|recv| L[接收 PNG 图像数据]
-        L --> M[IStream 内存流加载<br/>=> CImage]
-        M --> N[InvalidateRect<br/>通知窗口重绘]
+    subgraph SERVER["rc_server（被控端）"]
+        direction TB
+        S_CAP["IScreenCapture<br/>GDI BitBlt → DIB 段"]
+        S_ENC["FrameEncoder<br/>64×64 差分 + 压缩"]
+        S_INJ["IInputInjector<br/>SendInput"]
+        S_RX["接收线程<br/>recv → Decoder → 分发"]
+        S_CAPT["捕获线程<br/>帧请求 → 捕获 → 编码 → 入队"]
+        S_TX["发送线程<br/>出队 → SendAll"]
+        S_RX -->|Mouse / Key| S_INJ
+        S_RX -->|FrameRequest| S_CAPT
+        S_CAPT --> S_CAP --> S_ENC --> S_TX
     end
 
-    subgraph TCP["TCP 网络层"]
-        O[TCP/IP 协议<br/>端口 9999]
+    subgraph CLIENT["rc_client（控制端）"]
+        direction TB
+        C_UI["UI 线程<br/>WM_PAINT / 鼠标键盘"]
+        C_RD["收帧线程<br/>recv → Decoder → FrameDecoder → DIB 段"]
+        C_WR["发送线程<br/>请求 / 输入事件 / 心跳"]
+        C_UI -->|坐标映射 + 事件| C_WR
+        C_RD -->|kMsgFrameReady| C_UI
+        C_UI -->|Render 后请求下一帧| C_WR
     end
 
-    subgraph Server["服务端 Server (RemoteControl.cpp)"]
-        P[main 入口] --> Q[InitServer<br/>socket, bind, listen]
-        Q --> R[创建 3 条工作线程]
-        R --> R1[HandleScreenThreadFuc<br/>屏幕处理线程]
-        R --> R2[HandleMouseThreadFuc<br/>鼠标处理线程]
-        R --> R3[HandleKeyBoardThreadFuc<br/>键盘处理线程]
-        Q --> S[accept 等待客户端连接]
-        S --> T[主循环 recv 接收数据]
-        T --> U[ParsePacket 解析协议包]
-        U --> V[HandleCommand 命令分发]
-        
-        V -->|CMD_SCREEN| R1
-        V -->|CMD_MOUSE| R2
-        V -->|CMD_KEYBOARD| R3
-        
-        R1 --> W[HandleScreen<br/>BitBlt => PNG => send]
-        R2 --> X[HandleMouse<br/>SetCursorPos + mouse_event 模拟]
-        R3 --> Y[HandleKeyBoard<br/>SendInput 模拟键盘输入]
-    end
-
-    Client <-->|"请求屏幕 / 响应图像"| TCP
-    Client <-->|"发送鼠标 / 键盘事件"| TCP
-    TCP <--> Server
+    S_TX <-->|"TCP，20B 包头 + CRC32"| C_RD
+    C_WR <-->|"TCP"| S_RX
 ```
 
-### 2.2 数据流图
+请求-响应是**锁步**的：客户端画完一帧才请求下一帧，天然形成背压，服务端不需要猜客户端能消费多少。
+
+---
+
+## 4. 协议设计
+
+### 4.1 包头（20 字节，`#pragma pack(1)`）
+
+```
++----------+---------+---------+------------+-----------+-----------+
+| magic 4B | cmd 2B  | flags2B | body_len4B | seq 4B    | crc32 4B  |
+| 'RCV2'   |         |         |            |           | body 校验 |
++----------+---------+---------+------------+-----------+-----------+
+```
+
+`crc32` 覆盖包体，`seq` 每方向独立自增。有了定长头和校验，解包器可以**按状态推进**：
+
+```
+等待包头(20B) → 校验 magic / body_len 上限 → 等待包体(body_len) → 校验 CRC32 → 交付
+        ↓ 任一步失败
+   滑过 1 字节，重新寻找下一个合法包头（重同步）
+```
+
+旧版是把缓冲区丢给 `ParsePacket` 扫魔数，但返回的包**不带偏移量**，调用方一律假设包头在 `buffer[0]`；一旦出现脏字节，`memmove` 的步长和实际消费量不一致，整条流永久错位且无法恢复。这个 bug 在 v2 里被彻底消掉了。
+
+### 4.2 命令
+
+| 值 | 名称 | 方向 | 说明 |
+|--:|:--|:--|:--|
+| 1 | `kHello` | C→S | 版本、口令哈希、客户端可显示尺寸 |
+| 2 | `kHelloAck` | S→C | 帧尺寸、降采样倍数、虚拟桌面原点 |
+| 3 | `kFrameRequest` | C→S | 空包体 |
+| 4 | `kFrame` | S→C | 帧头 + 分块表 + 像素 |
+| 5 | `kMouse` | C→S | 动作 + 滚轮增量 + 绝对坐标 |
+| 6 | `kKey` | C→S | 虚拟键码 + 扫描码 + 按下/抬起 |
+| 7 / 8 | `kPing` / `kPong` | 双向 | 2 秒心跳，8 秒无流量判定断线 |
+| 9 | `kBye` | 双向 | 版本不匹配 / 口令错误 / 协议错误 |
+
+### 4.3 为什么用 TCP
+
+屏幕帧必须完整到达才有意义，UDP 上要自己做重传 + 重排序，工作量远大于它带来的延迟收益；局域网 RTT 在 1ms 量级，锁步请求-响应的往返开销可以忽略。真正的延迟来源是**编码耗时**而不是协议栈——第 9 节的数据能证明这一点。
+
+---
+
+## 5. 帧编码：分块差分 + 压缩
+
+### 5.1 帧体布局
+
+```
+FrameHead (24B)
+├── frame_id, screen_w/h, tile_size, tiles_x/y
+├── tile_count          // 0 表示"画面无变化"，此时整个帧体只有 24 字节
+├── cursor_x/y, cursor_visible
+└── key_frame           // 1 = 所有分块都是脏块
+
+TileEntry × tile_count (10B each)
+├── tile_index          // = ty * tiles_x + tx
+├── width, height
+└── data_len
+
+像素数据（按分块表顺序紧密排列，BGRA8888）
+```
+
+### 5.2 编码流程
+
+1. `BitBlt` 到一个复用的小端 DIB 段（不是每帧新建 DC/位图）；
+2. 逐块与上一帧 `memcmp`，记录脏块；
+3. 只把脏块的像素搬进帧体；
+4. 帧体整体压缩，只有压缩后真的更小才替换并打标志位；
+5. 上一帧缓冲只更新脏块，避免每帧 8MB 全量拷贝。
+
+### 5.3 为什么按块而不是按行/按像素
+
+- 按像素：差分最精确，但索引开销（每像素几个字节）会把收益吃掉；
+- 按行：一行里改一个像素就得重传 8KB；
+- 64×64：一块 16KB，压缩器有足够上下文；块表开销 10B/块，1080p 满屏也只有 5KB。
+
+分块粒度是 `--tile` 可调的（16~256），默认 64。
+
+---
+
+## 6. 线程模型
+
+### 6.1 服务端：三流水线
+
+| 线程 | 职责 |
+|:--|:--|
+| 接收线程 | `recv` → `Decoder` → 分发：鼠标/键盘直接注入，帧请求置位条件变量 |
+| 捕获线程 | 等帧请求 → 捕获 → 差分编码 → 压缩 → 入发送队列 |
+| 发送线程 | 出队 → `SendAll`，**socket 的唯一写入者** |
+
+### 6.2 客户端：读写分离
+
+UI 线程和收帧线程都**不直接写 socket**：所有出站数据塞进 `BlockingQueue`，由发送线程独占写入。
+
+这是 v1 最严重的 bug 修复：v1 里 UI 线程发鼠标/键盘、收屏线程发帧请求，**两个线程同时对同一个 socket 调 `send` 且完全无锁**，TCP 字节流会交错。现在 `SendAll` 内部还有一层互斥兜底。
 
 ```mermaid
 sequenceDiagram
-    participant Client as 客户端
-    participant Server as 服务端
-
-    Note over Client,Server: === 屏幕捕获与显示循环 ===
-    loop 持续请求屏幕
-        Client->>Server: CMD_SCREEN 请求（仅 header，body_len=0）
-        Server->>Server: BitBlt 截取屏幕
-        Server->>Server: CImage 编码为 PNG
-        Server->>Server: IStream 内存流序列化
-        Server->>Client: CMD_SCREEN 响应（PNG 二进制数据）
-        Client->>Client: IStream 反序列化 => CImage
-        Client->>Client: InvalidateRect => WM_PAINT => StretchBlt 绘制
-    end
-
-    Note over Client,Server: === 鼠标事件处理 ===
-    Client->>Client: WM_MOUSEMOVE / WM_LBUTTONDOWN 等
-    Client->>Client: 坐标缩放（本地窗口 => 远程屏幕）
-    Client->>Server: CMD_MOUSE（Mouse 结构体）
-    Server->>Server: SetCursorPos / mouse_event 模拟
-
-    Note over Client,Server: === 键盘事件处理 ===
-    Client->>Client: WM_KEYDOWN
-    Client->>Server: CMD_KEYBOARD（KeyBoard 结构体）
-    Server->>Server: SendInput 模拟按键
+    participant UI as UI 线程
+    participant Q as 发送队列
+    participant W as 发送线程
+    participant R as 收帧线程
+    UI->>Q: 鼠标/键盘/帧请求
+    R->>Q: 心跳
+    Q->>W: 出队
+    W->>W: SendAll（唯一写入者）
+    R-->>UI: kMsgFrameReady → InvalidateRect
 ```
+
+### 6.3 为什么不用 `PostThreadMessage`
+
+v1 用 `CreateThread` + `PostThreadMessage` 给三个工作线程派活，问题有三个：
+
+1. 线程的消息队列在首次 `GetMessage` 前不存在，`Post` 会静默失败——v1 靠 `Sleep(100)` 赌；
+2. 没有背压能力，只能无限堆积；
+3. 指针通过 `lParam` 跨线程传递，所有权靠约定，容易漏 `free`。
+
+v2 换成 `std::thread` + `std::condition_variable` + 有界队列：所有权明确（`std::vector` 移动），队列满时明确丢帧并计数。
+
+### 6.4 三个让鼠标"发涩"的坑
+
+远程桌面里"鼠标延迟"往往不是网络问题。这一版踩到并修掉的有三个：
+
+| 问题 | 现象 | 修法 |
+|:--|:--|:--|
+| 鼠标事件映射要抢 `paint_mutex_`，而收帧线程解码整帧时长时间持有它 | 每次移鼠标都要等当前帧解码完，手感一顿一顿 | 把表面尺寸 / 原点 / 缩放全部用原子量发布，映射路径**完全不加锁** |
+| 每次 `WM_PAINT` 都发一条帧请求；窗口重绘抖动时把服务端打成一帧接一帧满负荷编码 | 服务端 CPU 打满，帧反而更慢 | 请求-响应锁步 + `frame_pending_` 标志，同一时刻最多一条请求在途（1 秒兜底） |
+| 客户端在画面上叠加"远端光标" | 本机指针是即时的，叠加的那个要等下一帧才动，视觉上就是"鼠标在追" | 默认不画。`--show-cursor` 可选打开 |
+
+第三条要展开说一句：GDI `BitBlt` 抓屏**不包含光标**，所以远端画面里本来就没有指针。客户端窗口上显示的是**本机的系统光标**，它已经在正确的位置了；再叠一个"远端光标"只会让人看到两个箭头，而其中慢的那个会立刻被大脑判定成"卡"。关掉之后同样的网络条件下手感会好很多。
 
 ---
 
-## 3. 项目文件结构
+## 7. 构建与运行
+
+### 7.1 环境
+
+| 项 | 要求 |
+|:--|:--|
+| 构建机 OS | Windows 10 / 11 x64 |
+| 构建机编译器 | Visual Studio 2022 或 2026（MSVC v143/v145），C++20 |
+| 构建 | CMake ≥ 3.20 |
+| 依赖 | 仅系统库：`ws2_32` `cabinet` `user32` `gdi32` |
+| **目标机** | **Windows 10 x64 及以上，不需要装任何运行时** |
+
+没有第三方依赖。压缩用的是 Windows 自带的 Compression API（`CABINET.LIB`）。默认静态链接 C 运行库，产物可以直接拷到干净的机器上跑，见 7.6。
+
+### 7.2 构建
+
+```powershell
+cmake -S . -B build -A x64
+cmake --build build --config Release
+```
+
+也可以直接用 Visual Studio 打开仓库根目录（VS 会读取 `CMakeLists.txt`）。
+
+产物在 `build\Release\`：`rc_server.exe`、`rc_client.exe`（GUI 子系统）、`rc_tests.exe`、`rc_bench.exe`。
+
+### 7.3 运行
+
+**被控端**：
+
+```powershell
+.\build\Release\rc_server.exe --port 9999 --token mysecret --verbose
+```
+
+**控制端**：
+
+```powershell
+.\build\Release\rc_client.exe --host 192.168.1.10 --port 9999 --token mysecret
+```
+
+客户端窗口会同步显示远端桌面；鼠标拖动、滚轮、键盘输入都会转发过去。断线后自动重连（1 秒退避）。
+
+服务端是控制台程序，输出走 `WriteConsoleW`（UTF-16），**不需要 `chcp 65001`，中文 Windows 的 GBK 控制台也不会乱码**；输出被重定向到文件/管道时则按 UTF-8 写。
+
+### 7.4 参数
+
+`rc_server`
+
+| 参数 | 默认 | 说明 |
+|:--|:--|:--|
+| `--port <n>` | 9999 | 监听端口 |
+| `--token <s>` | 空 | 连接口令；为空时只打印警告，不校验 |
+| `--scale <n>` | 1 | 强制降采样 1~4 倍；实际值取 `max(--scale, 由客户端窗口推出的倍数)` |
+| `--codec <name>` | `auto` | `auto` / `huff`（快）/ `mszip`（省带宽） |
+| `--tile <n>` | 64 | 分块边长 16~256 |
+| `--max-fps <n>` | 0 | 出帧上限，0 = 不限 |
+| `--verbose` | 关 | 每秒打印 fps / 出站带宽 / 平均脏块数 |
+
+`rc_client`
+
+| 参数 | 默认 | 说明 |
+|:--|:--|:--|
+| `--host <s>` | 127.0.0.1 | 服务端地址 |
+| `--port <n>` | 9999 | 服务端端口 |
+| `--token <s>` | 空 | 口令 |
+| `--show-cursor` | 关 | 在画面上叠加远端光标。**默认关闭**，理由见 6.4 |
+| `--log <path>` | rc_client.log | 日志文件（GUI 程序没有控制台） |
+
+### 7.5 重新生成截图
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\capture-screenshot.ps1
+```
+
+脚本会起一对服务端/客户端、等 5 秒、截全屏、再关掉进程。它跑的是"本机自连"，截出来是镜中镜效果，适合快速自测。
+
+README 顶部那张是**真实部署**下截的：`rc_server` 在虚拟机里、`rc_client` 在宿主机。演示/简历用的截图建议照这个方式截，桌面干净、也没有私人内容。
+
+### 7.6 拷贝到虚拟机 / 另一台机器
+
+默认**静态链接 MSVC 运行库（`/MT`）**，所以 exe 只依赖系统 DLL，目标机器不需要装 Visual Studio，也不需要「VC++ 可再发行组件包」：
 
 ```
-RemoteControl/
-├── RemoteControl.slnx                 # Visual Studio 解决方案文件
-├── README.md                          # 本文档
-├── clientshow.gif                     # 客户端运行演示动图
-├── servershow.gif                     # 服务端运行演示动图
+rc_server.exe  →  WS2_32.dll  Cabinet.dll  USER32.dll  GDI32.dll  KERNEL32.dll
+rc_client.exe  →  同上 + SHELL32.dll
+rc_tests.exe   →  同上
+```
+
+一条命令生成可拷走的分发包：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\make-dist.ps1
+```
+
+产出 `dist\`：
+
+```
+dist\
+├── rc_server.exe      被控端
+├── rc_client.exe      控制端
+├── run-server.bat     双击启动（参数会透传：run-server.bat --token abc）
+├── run-client.bat     双击启动，按提示输入被控机 IP
+└── readme-cn.txt      使用说明
+```
+
+把整个 `dist\` 拷进虚拟机就行。体积代价：服务端 63 KB → 228 KB。想换回 `/MD`：
+
+```powershell
+cmake -S . -B build -A x64 -DRC_STATIC_RUNTIME=OFF
+```
+
+目标机器的最低要求：**Windows 10 x64 及以上**。原因有两个：`_WIN32_WINNT` 定在 0x0A00；压缩用的 `Compress`/`Decompress` 是 `Cabinet.dll` 从 Windows 8 才导出的函数，在 Win7 上会报「无法定位程序输入点」。
+
+### 7.7 常见问题
+
+| 现象 | 原因与处理 |
+|:--|:--|
+| 「计算机中丢失 VCRUNTIME140.dll」/「MSVCP140.dll」 | 用 `-DRC_STATIC_RUNTIME=ON`（默认）重新构建；或给目标机装 VC++ 可再发行包 |
+| 「无法定位程序输入点 Compress 于 Cabinet.dll」 | 目标系统低于 Windows 8，压缩 API 不存在 |
+| 「无法启动此程序，因为它是 32 位应用程序」/「不是有效的 Win32 应用程序」 | 位数不匹配。本项目只构建 x64，请用 64 位 Windows |
+| 双击后窗口闪一下就没了 | 程序本身是控制台程序，出错会立刻退出。**从 PowerShell 运行**才能看到错误输出 |
+| 「Windows 已保护你的电脑，已阻止此应用」 | 拷贝/下载来的 exe 带了「来自网络」标记。右键属性 → 勾选「解除锁定」，或 `Unblock-File .\rc_server.exe` |
+| 杀毒软件直接删掉 exe | 抓屏 + 输入注入的行为特征和远控工具一致。加白名单即可（这是这类程序的固有代价） |
+| 客户端一直「正在连接」 | 防火墙没放行 9999；或被控机 IP 写错。看服务端控制台有没有「客户端已连接」 |
+
+---
+
+## 8. 测试
+
+```powershell
+ctest --test-dir build -C Release --output-on-failure
+```
+
+当前 **70 条断言**，覆盖的都是容易退化的边界：
+
+| 用例 | 验证点 |
+|:--|:--|
+| CRC32 标准向量 | `"123456789"` → `0xCBF43926`，增量计算与一次性计算一致 |
+| 逐字节投递 | 把流拆成 1 字节一次投递，仍能正确解出全部包 |
+| 粘包 | 一次投递 5 个包，按序全部取出 |
+| 脏数据前缀 | 37 字节垃圾后跟合法包，重同步且 `dropped_bytes == 37` |
+| 包体损坏 | CRC 失败丢单包，后续包继续解析 |
+| 越界 `body_len` | 超大长度被拒绝并重同步，不产生巨额分配 |
+| 首帧 | 必须是关键帧，脏块数 == 总块数 |
+| 静止画面 | 脏块 0，帧体恰好 24 字节 |
+| 单像素变化 | 恰好 1 个脏块，且是对应块 |
+| 像素往返 | 关键帧 + 增量帧解码后与原图逐字节一致 |
+| 截断帧体 | 拒绝解码（不能越界写客户端表面） |
+| 压缩往返 | XPRESS_HUFF 与 MSZIP 各跑一遍，并验证超限输出被拒 |
+| 命令行 | `--key value` / `--flag` 两种形式 |
+
+---
+
+## 9. 性能数据
+
+### 9.1 编码基准（可复现）
+
+```powershell
+.\build\Release\rc_bench.exe
+```
+
+1920×1080 合成桌面，40 帧（静态壁纸 + 移动窗口 + 变化的进度条），XPRESS_HUFF：
+
+| 方案 | 平均每帧 | 相对 PNG | 平均耗时 | 单核编码上限 |
+|:--|--:|--:|--:|--:|
+| 整帧 PNG（v1 的做法） | 1716.5 KB | 100.0% | 56.60 ms | 17.7 fps |
+| 整帧 + 压缩（不差分） | 2717.8 KB | 158.3% | 22.78 ms | 43.9 fps |
+| **分块脏块 + 压缩（v2）** | **107.8 KB** | **6.3%** | **3.11 ms** | **322 fps** |
+| 静止画面（v2） | **24 B** | 0.001% | 1.31 ms | 762 fps |
+
+v2 的 ~3 ms 里，差分约 2.0 ms、压缩约 1.1 ms；平均每帧 56.4 / 510 个脏块。
+
+> 数字来自单次运行。三次重复运行的耗时在 2.9~3.4 ms 之间波动（约 ±10%），字节数完全稳定——字节数只取决于画面内容，耗时取决于机器和当前负载。
+
+**第二行的意义**：只把 PNG 换成更快的压缩算法，帧率从 17.7 提到 43.9，但字节数反而涨了 58%——**换编码器救不了"每帧都传整屏"这个模型**。真正的收益来自差分。
+
+### 9.2 实测（本机局域网）
+
+2560×1600 物理桌面 → 1024 宽客户端（协商后降采样 1/2 → 1280×800，共 260 个块）：
+
+| 算法 | 帧率 | 出站带宽 | 平均脏块 |
+|:--|--:|--:|--:|
+| MSZIP | 3.5 fps | 6.9 MB/s | 240 / 260 |
+| XPRESS_HUFF | **8.2 fps** | 18 MB/s | 240 / 260 |
+
+这两个数字要带着上下文读：这台机器的桌面背景是持续动画的高熵画面，每帧 92% 的块都在变，差分几乎没起作用，带宽被内容本身的熵顶住了。换成静态桌面（写代码、看文档）就是上面"静止画面 24 B/帧"那一行。这也正是下面那条建议的由来。
+
+MSZIP 与 XPRESS_HUFF 的取舍是数据说话：**快 2.3 倍，带宽多 2.6 倍**。所以做成 `--codec` 可切换，而不是拍一个默认值走到底。
+
+---
+
+## 10. 演示环境建议：服务端放虚拟机
+
+**推荐把 `rc_server` 跑在虚拟机里，`rc_client` 跑在宿主机。** 四个理由：
+
+1. **安全边界**。这个程序会在服务端重放任意鼠标键盘输入。跑在真机上，任何能连上端口的人（默认甚至没有口令）都能接管你的桌面；VM 里最坏情况是回滚快照。
+2. **演示效果干净**。第 9.2 节的实测说明差分效果高度依赖画面是否静止。虚拟机里是干净的静态桌面，脏块会掉到个位数，帧率和带宽立刻好看一个数量级；截图里也不会出现私人内容。
+3. **测试条件可复现**。想看不同分辨率 / DPI / 多显示器的表现，改 VM 设置就行，不用折腾物理显示器。
+4. **演示更专业**。"服务端跑在 VM、客户端在我本机、实时同步"本身就是一句能展开讲两分钟的话。
+
+虚拟机建议：1920×1080、单显示器、关闭桌面动画与壁纸轮播、Windows 10/11 x64、桥接或仅主机网络。
+
+> 抓屏用的是 GDI `BitBlt`，虚拟机的基础显示适配器能抓到；但将来换 DXGI Desktop Duplication 后端时，部分 VM 需要打开 3D 加速。
+
+---
+
+## 11. v1 → v2 修掉了什么
+
+第一版能跑，但复盘下来有 10 个真问题。列在这里是因为**"发现了什么、怎么验证、怎么修"比"写完了"更值得说**：
+
+| # | v1 的问题 | 后果 | v2 的做法 |
+|--:|:--|:--|:--|
+| 1 | 窗口类缺 `CS_DBLCLKS` | 双击消息永不投递，双击功能是死代码 | 补上样式；双击改为"两次 down/up"，不再单设协议命令 |
+| 2 | 两线程无锁并发 `send` 同一 socket | TCP 字节流交错，偶发花屏/卡死 | 单一发送线程 + 出站队列，`SendAll` 内部再加锁兜底 |
+| 3 | `int InitWindow()` 末尾没有 `return` | 未定义行为（C4715） | 重构为构造函数语义，MSVC `/W4` 零警告 |
+| 4 | 解包器返回的包不带偏移量，调用方假设包头在 `buffer[0]` | 出现脏字节后整条流永久错位 | 定长头 + 状态机解包，显式重同步分支，有单测 |
+| 5 | 协议结构体在 client/server 里各写一份 | 改协议必然漏改一边 | `include/rc/protocol.h` 单一副本，`static_assert` 锁尺寸 |
+| 6 | 服务端 `PackPacket` 不判 `malloc` 返回值 | OOM 崩溃 | 所有分配路径判空；包体由 `std::vector` 管理 |
+| 7 | 硬编码 IP `192.168.3.53:9999` | 换机器要改代码重编 | 命令行参数 |
+| 8 | 无滚轮、无 `SetCapture`、不画远端光标 | 拖拽划出窗口就丢事件，看不见指针 | 三者都补上；等比缩放 + 黑边 + 坐标反算 |
+| 9 | 12 个鼠标消息分支复制粘贴约 235 行 | 占客户端源码 1/3 | 收敛成 `SendMouse(action, x, y)` |
+| 10 | `.gitignore` 忽略了 `*.slnx` | 仓库里没有解决方案文件，clone 下来打不开 | 改用 CMake，构建入口回到版本控制里 |
+
+另外补上了 v1 完全没有的东西：单元测试、CI、带数字的基准、可视化日志、心跳与断线重连。
+
+---
+
+## 12. 已知限制与下一步
+
+诚实列一下，这些都是明确知道但还没做的：
+
+**性能**
+- 全屏动画内容仍然慢（第 9.2 节）。差分的上限就是"内容变了多少"，对有视频/动画的桌面无效；真正的解法是换视频编码（H.264/AV1）或按区域自适应降质量。
+- GDI `BitBlt` 抓不到部分独占全屏的 DirectX 应用，也没有硬件加速。下一步是 `DXGI Desktop Duplication`，接口（`IScreenCapture`）已经留好。
+- 差分是纯粹的逐块 `memcmp`，没有做局部静止块的预测。
+
+**功能**
+- 没有剪贴板同步、文件传输、多客户端并发（服务端是单会话串行）。
+- 光标画的是系统箭头，不是远端真实的光标形状。
+- 没有音频。
+
+**安全**
+- 只有口令哈希（FNV-1a），**没有加密**，也没有防重放。口令不以明文出现，但画面和按键是明文。公网使用必须套 VPN/SSH 隧道，或者把 TLS（Schannel）补上——这是下一优先级最高的一项。
+- 没有连接数限制和来源 IP 白名单。
+
+**可移植性**
+- 只支持 Windows + MSVC。魔数和整数字段用主机字节序，大端平台不兼容。
+- 多显示器只能选"整个虚拟桌面"，不能分别选。
+
+---
+
+## 13. 目录结构
+
+```
+.
+├── CMakeLists.txt              # 唯一的构建入口
+├── include/rc/                 # 公共头文件
+│   ├── protocol.h              # 协议单一副本：包头、命令、帧布局
+│   ├── stream.h                # 流式编解码（状态机 + 重同步）
+│   ├── frame.h                 # 分块差分编码 / 解码
+│   ├── compress.h              # XPRESS_HUFF / MSZIP 封装
+│   ├── net.h                   # WinSock RAII 封装，线程安全 SendAll
+│   ├── queue.h                 # 有界阻塞队列
+│   ├── crc32.h  clock.h  cli.h  dpi.h  log.h
 │
-├── client/                            # 客户端项目
-│   ├── client.cpp                     # 客户端核心源码（~740 行）
-│   ├── client.vcxproj                 # VS 项目文件
-│   ├── client.vcxproj.filters         # VS 文件过滤器
-│   └── x64/Debug/                     # 编译产物
-│       └── client.exe
+├── src/
+│   ├── common/                 # 协议、网络、压缩、差分、日志（两端共用）
+│   ├── server/
+│   │   ├── capture.{h,cpp}     # IScreenCapture + GDI 后端
+│   │   ├── inject.{h,cpp}      # IInputInjector + SendInput 后端
+│   │   ├── session.{h,cpp}     # 三流水线会话
+│   │   └── main.cpp            # 监听 / 参数 / Ctrl+C
+│   └── client/
+│       ├── surface.{h,cpp}     # DIB 渲染表面 + 等比布局
+│       ├── session.{h,cpp}     # 连接、收帧、发送、重连
+│       ├── window.{h,cpp}      # 窗口过程、输入映射、光标
+│       └── main.cpp            # WinMain
 │
-└── RemoteControl/                     # 服务端项目
-    ├── RemoteControl.cpp              # 服务端核心源码（~530 行）
-    ├── RemoteControl.vcxproj          # VS 项目文件
-    ├── RemoteControl.vcxproj.filters  # VS 文件过滤器
-    ├── test.png                       # 测试截屏文件
-    └── x64/Debug/
-        ├── RemoteControl.exe          # 服务端可执行文件
-        └── RemoteControl.pdb          # 调试符号
-```
-
----
-
-## 4. 通信协议设计
-
-### 4.1 协议结构
-
-系统自定义了一套简单的二进制通信协议：
-
-```
-+----------------+----------------+----------------+----------------+
-|    magic (4B)  |    cmd (4B)    |  body_len (4B) |  body (变长)   |
-+----------------+----------------+----------------+----------------+
-|   0x12345678   |   命令号       |   数据长度      |   数据内容      |
-+----------------+----------------+----------------+----------------+
-                 |<------- PacketHeader (12 字节) -------->|
-                 |<-------------- Packet (12 + body_len 字节) ------------->|
-```
-
-### 4.2 结构体定义
-
-```cpp
-// 1 字节对齐，消除填充字节，确保跨平台兼容
-#pragma pack(push, 1)
-struct PacketHeader {
-    int magic;       // 魔数 0x12345678，用于校验和数据边界识别
-    int cmd;         // 命令号
-    int body_len;    // 数据体长度
-};
-#pragma pack(pop)
-
-struct Packet {
-    PacketHeader header;  // 包头
-    char body[];          // 柔性数组：不占结构体大小，动态分配
-};
-```
-
-### 4.3 命令号枚举
-
-| 命令号 | 枚举名 | 值 | 说明 | 方向 |
-|--------|--------|-----|------|------|
-| `CMD_SCREEN` | 屏幕数据 | 1 | 请求或响应屏幕图像数据 | 客户端→服务端（请求）/ 服务端→客户端（响应） |
-| `CMD_MOUSE` | 鼠标事件 | 2 | 鼠标动作 + 坐标 | 客户端→服务端 |
-| `CMD_KEYBOARD` | 键盘事件 | 4 | 虚拟键码 + 按下/抬起状态 | 客户端→服务端 |
-| `CMD_TESTCONNECT` | 测试连接 | 200 | 连接性测试（预留） | 双向 |
-
-### 4.4 数据子结构
-
-**鼠标事件结构：**
-```cpp
-struct Mouse {
-    int action;     // 鼠标行为（移动/按下/抬起/单击/双击）
-    POINT ptXY;     // 屏幕坐标 (x, y)
-};
-```
-
-**鼠标动作枚举（共 13 种）：**
-| 枚举值 | 常量名 | 说明 |
-|--------|--------|------|
-| 1 | `MOUSE_MOVE` | 鼠标移动 |
-| 2 | `MOUSE_LDOWN` | 左键按下 |
-| 3 | `MOUSE_LUP` | 左键抬起 |
-| 4 | `MOUSE_RDOWN` | 右键按下 |
-| 5 | `MOUSE_RUP` | 右键抬起 |
-| 6 | `MOUSE_MDOWN` | 中键按下 |
-| 7 | `MOUSE_MUP` | 中键抬起 |
-| 8 | `MOUSE_LCLICK` | 左键单击 |
-| 9 | `MOUSE_RCLICK` | 右键单击 |
-| 10 | `MOUSE_MCLICK` | 中键单击 |
-| 11 | `MOUSE_LDCLICK` | 左键双击 |
-| 12 | `MOUSE_RDCLICK` | 右键双击 |
-| 13 | `MOUSE_MDCLICK` | 中键双击 |
-
-**键盘事件结构：**
-```cpp
-struct KeyBoard {
-    int virtual_code;  // Windows 虚拟键码 (VK_xxx)
-    int key_status;    // 0 = 按下, 1 = 松开
-};
-```
-
-### 4.5 协议工具函数
-
-```cpp
-// 打包：将 cmd + 数据 封装为 Packet
-Packet* PackPacket(int cmd, char* buffer, int buffer_len);
-
-// 解包：从原始缓冲区解析出 Packet（含魔数扫描定位）
-Packet* ParsePacket(char* buffer, int len);
-
-// 获取包总长度：body_len + sizeof(PacketHeader)
-int GetPacketLen(Packet* pck);
-```
-
-**解包流程（魔数扫描 → 边界定位）：**
-```
-缓冲区数据: [... 0x12 0x34 0x56 0x78 cmd body_len body_data ...]
-              ↑
-              逐字节扫描直到匹配 0x12345678 → 定位包头起始位置
-              → 读取 cmd (4B) → 读取 body_len (4B) → 拷贝 body 数据
-```
-
----
-
-## 5. 线程模型
-
-### 5.1 服务端线程模型
-
-```mermaid
-graph LR
-    subgraph MainThread["主线程"]
-        M1[socket, bind, listen]
-        M2[accept 阻塞等待]
-        M3[recv 循环接收数据]
-        M4[ParsePacket 解析]
-        M5[HandleCommand 分发]
-    end
-
-    subgraph ScreenThread["屏幕处理线程"]
-        S1[GetMessage 消息循环]
-        S2[HandleScreen]
-        S3[BitBlt 截屏 => PNG 编码 => send]
-    end
-
-    subgraph MouseThread["鼠标处理线程"]
-        MT1[GetMessage 消息循环]
-        MT2[HandleMouse]
-        MT3[SetCursorPos + mouse_event]
-    end
-
-    subgraph KeyThread["键盘处理线程"]
-        K1[GetMessage 消息循环]
-        K2[HandleKeyBoard]
-        K3[SendInput 模拟按键]
-    end
-
-    M5 -->|PostThreadMessage<br/>WM_HANDLE_SCREEN| ScreenThread
-    M5 -->|PostThreadMessage<br/>WM_HANDLE_MOUSE| MouseThread
-    M5 -->|PostThreadMessage<br/>WM_HANDLE_KEYBOARD| KeyThread
-```
-
-**关键设计点：**
-
-1. **线程消息队列激活**：使用 `PostThreadMessage` 发送 `WM_HANDLE_INVOKE_MSG_LOOP` 消息来激活各工作线程的消息队列（在 Windows 中，线程的消息队列在第一次调用 `GetMessage` 之前不会被创建）。
-
-2. **异步分发**：主线程通过 `PostThreadMessage` 将解析出的 `Packet*` 指针投递到对应的工作线程消息队列，实现"接收-分发-处理"的解耦。
-
-3. **工作线程安全释放**：各工作线程在处理完 `WM_HANDLE_*` 消息后调用 `free(packet)` 释放内存。
-
-### 5.2 客户端线程模型
-
-```mermaid
-graph LR
-    subgraph UIThread["UI 线程（主线程）"]
-        U1[WinMain 入口]
-        U2[InitWindow 创建窗口]
-        U3[connect 连接服务器]
-        U4[GetMessage 消息循环]
-        U5[winProc 窗口过程]
-    end
-
-    subgraph ScreenThread2["屏幕接收线程"]
-        ST1[SendScreenCallBack]
-        ST2[循环: send CMD_SCREEN 请求]
-        ST3[recv 接收 PNG 数据]
-        ST4[IStream => CImage 加载]
-        ST5[InvalidateRect 通知重绘]
-    end
-
-    U5 -->|WM_PAINT| P1[StretchBlt 绘制远程画面]
-    U5 -->|WM_MOUSEMOVE| P2[PackPacket => send]
-    U5 -->|WM_KEYDOWN| P3[PackPacket => send]
-
-    ScreenThread2 -->|EnterCriticalSection<br/>操作 g_image| UIThread
-    ScreenThread2 -->|InvalidateRect| UIThread
-```
-
-**关键设计点：**
-
-1. **临界区保护**：`g_image` 对象由 UI 线程（读）和屏幕接收线程（写）共享访问，使用 `CRITICAL_SECTION g_cri_sec` 保护。
-
-2. **跨线程 UI 更新**：工作线程不能直接操作 UI 控件，通过 `InvalidateRect(g_hwnd, NULL, FALSE)` + `UpdateWindow(g_hwnd)` 通知 UI 线程重绘。
-
-3. **坐标缩放**：客户端窗口坐标按比例映射到远程屏幕坐标：
-   ```cpp
-   rxPos = xPos * g_remote_width  / client_width;
-   ryPos = yPos * g_remote_height / client_height;
-   ```
-
----
-
-## 6. 核心流程详解
-
-### 6.1 服务端流程
-
-```
-main()
-├── InitServer()
-│   ├── WSAStartup(2,2)           # 初始化 WinSock
-│   ├── socket(AF_INET, TCP)      # 创建 TCP 套接字
-│   ├── bind(0.0.0.0:9999)        # 绑定本地所有 IP
-│   └── listen(5)                 # 开始监听
-├── CreateThread × 3              # 创建 3 条工作线程
-├── PostThreadMessage × 3         # 激活各工作线程消息队列
-├── Sleep(100)                    # 等待消息队列就绪
-├── accept()                      # 阻塞等待客户端连接
-├── while(true):
-│   ├── recv()                    # 阻塞接收数据
-│   ├── 追加到缓冲区
-│   ├── ParsePacket()             # 解析协议包
-│   └── HandleCommand()           # 分发到对应线程处理
-└── closesocket / WSACleanup      # 清理资源
-```
-
-### 6.2 客户端流程
-
-```
-WinMain()
-├── InitializeCriticalSection()   # 初始化临界区
-├── InitWindow()
-│   ├── RegisterClass()           # 注册窗口类 "MainWindow"
-│   ├── CreateWindow(800×600)     # 创建窗口 "远程控制"
-│   └── ShowWindow / UpdateWindow
-├── InitSocket()
-│   ├── WSAStartup(2,2)
-│   ├── socket()
-│   └── 设置目标地址 192.168.3.53:9999
-├── connect()                     # 连接服务端
-├── CreateThread(SendScreenCallBack)  # 创建屏幕接收线程
-└── while(GetMessage())           # 消息循环
-    ├── TranslateMessage()
-    └── DispatchMessage()
-        └── winProc()             # 处理鼠标/键盘/绘制消息
-```
-
-### 6.3 屏幕捕获与传输流程
-
-```mermaid
-flowchart TD
-    A[客户端发送 CMD_SCREEN 请求] --> B[服务端接收请求]
-    B --> C[HandleScreen 被调用]
-    
-    C --> D[GetDC NULL 获取屏幕 DC]
-    D --> E[GetDeviceCaps 获取位宽]
-    E --> F[GetSystemMetrics 获取屏幕宽高]
-    F --> G[CImage.Create 创建图像缓冲区]
-    G --> H["BitBlt SRCCOPY<br/>屏幕像素 => CImage"]
-    H --> I[ReleaseDC 释放屏幕 DC]
-    
-    I --> J[GlobalAlloc 申请全局内存]
-    J --> K[CreateStreamOnHGlobal<br/>创建 IStream 内存流]
-    K --> L["image.Save to PNG format<br/>CImage PNG 编码到流"]
-    L --> M[GlobalLock 获取内存指针]
-    M --> N[PackPacket 打包为 Packet]
-    N --> O["send PNG data to client<br/>发送 PNG 二进制数据"]
-    
-    O --> P[客户端 recv 接收]
-    P --> Q[ParsePacket 解包]
-    Q --> R[GlobalAlloc + CreateStreamOnHGlobal]
-    R --> S["pStream.Write body<br/>写入 PNG 数据到流"]
-    S --> T["pStream.Seek<br/>重置流指针"]
-    T --> U["EnterCriticalSection<br/>g_image.Load pStream"]
-    U --> V[LeaveCriticalSection]
-    V --> W["InvalidateRect + UpdateWindow<br/>触发 WM_PAINT 重绘"]
-    W --> X["WM_PAINT: g_image.StretchBlt<br/>图像自适应缩放绘制"]
-```
-
-**关键技术细节：**
-
-- **图像编码**：使用 CImage 内置的 `Gdiplus::ImageFormatPNG` 将屏幕数据压缩为 PNG 格式。PNG 是无损压缩，相比原始位图显著减小传输数据量。
-- **内存流**：使用 COM 接口 `IStream` + `HGLOBAL` 全局内存块，避免文件 I/O，直接在内存中完成"位图 → PNG → 网络数据包"的转换。
-- **图像加载**：客户端将接收到的 PNG 字节流通过 `IStream::Write` 写入内存流后 `CImage::Load`，无需落盘。
-- **重绘机制**：`InvalidateRect` 使窗口客户区无效 → `UpdateWindow` 绕过消息队列直接发送 `WM_PAINT` → `winProc` 中 `StretchBlt` 绘制。
-
-### 6.4 鼠标/键盘事件处理流程
-
-```
-客户端鼠标操作
-├── winProc 捕获 WM_MOUSEMOVE / WM_LBUTTONDOWN / WM_RBUTTONDBLCLK 等 12 种消息
-├── 提取 (xPos, yPos)
-├── 坐标缩放: rxPos = xPos * remote_width / client_width
-├── 构造 Mouse{action, ptXY} 结构体
-├── PackPacket(CMD_MOUSE, &mouse, sizeof(Mouse))
-├── send() 发送
+├── tests/
+│   ├── test_main.cpp           # 70 条断言的单元测试
+│   └── bench.cpp               # 编码基准（README 数字的来源）
 │
-└── 服务端接收
-    ├── HandleMouse 被调用
-    ├── memcpy 解析 Mouse 结构体
-    ├── SetCursorPos 设置鼠标位置
-    └── switch(action):
-        ├── MOUSE_MOVE → SetCursorPos
-        ├── MOUSE_LDOWN → mouse_event(LEFTDOWN)
-        ├── MOUSE_LUP   → mouse_event(LEFTUP)
-        ├── MOUSE_LCLICK→ mouse_event(LEFTDOWN | LEFTUP)
-        ├── MOUSE_LDCLICK → mouse_event × 2
-        └── ...
-
-客户端键盘操作
-├── winProc 捕获 WM_KEYDOWN / WM_SYSKEYDOWN
-├── 提取 wParam（虚拟键码）
-├── 构造 KeyBoard{virtual_code, key_status=0}
-├── PackPacket(CMD_KEYBOARD, &keyboard, sizeof(KeyBoard))
-├── send() 发送
-│
-└── 服务端接收
-    ├── HandleKeyBoard 被调用
-    ├── memcpy 解析 KeyBoard 结构体
-    ├── 填充 INPUT 结构体
-    └── SendInput(1, &input, sizeof(INPUT))
+├── tools/capture-screenshot.ps1
+├── docs/screenshot-client.png
+└── .github/workflows/build.yml # 构建 + ctest + 基准
 ```
 
 ---
 
-## 7. 关键技术点与 C++ 知识点
+## 声明
 
-### 7.1 网络编程 — WinSock2
+这是一个**学习性质**的远程桌面实现，用于本人两台机器之间的局域网实验。它具备完整的屏幕捕获与输入注入能力，请勿用于未经授权的机器；分发或部署时请务必设置 `--token` 并限定在内网。
 
-```cpp
-#pragma comment(lib, "ws2_32.lib")   // 链接 WinSock 库
+## 许可
 
-// 初始化 WinSock
-WSADATA wsaData;
-WSAStartup(MAKEWORD(2, 2), &wsaData);
+[MIT](LICENSE) © 2026 three
 
-// 创建套接字
-SOCKET s = socket(AF_INET, SOCK_STREAM, 0);  // IPv4, TCP
+代码可自由使用、修改和分发。**使用者对自己部署和使用该软件的行为负责**，作者不对任何滥用或由此产生的后果承担责任。
 
-// 服务端绑定与监听
-SOCKADDR_IN addr;
-addr.sin_family = AF_INET;
-addr.sin_port = htons(9999);           // 端口 9999
-addr.sin_addr.S_un.S_addr = INADDR_ANY; // 绑定所有 IP
-bind(s, (SOCKADDR*)&addr, sizeof(addr));
-listen(s, 5);                          // 最大 5 个连接等待
-
-// 客户端连接
-addr.sin_addr.S_un.S_addr = inet_addr("192.168.3.53");
-connect(s, (SOCKADDR*)&addr, sizeof(addr));
-
-// 发送与接收
-send(s, buffer, len, 0);
-recv(s, buffer, buffer_size, 0);
-
-// 清理
-closesocket(s);
-WSACleanup();
-```
-
-| 知识点 | 说明 |
-|--------|------|
-| **TCP vs UDP** | 项目使用 TCP（可靠、有序、面向连接），适合屏幕数据传输的完整性要求 |
-| **网络字节序** | `htons()` 将主机字节序转为网络字节序（大端），端口号必须转换 |
-| **阻塞式 I/O** | `accept`/`recv` 默认阻塞，等待数据到达才返回 |
-| **INADDR_ANY** | 服务端绑定所有本地 IP 地址，局域网任何网卡均可连接 |
-
-### 7.2 内存对齐与柔性数组
-
-```cpp
-// 1 字节对齐：消除编译器自动填充，确保结构体跨平台二进制一致
-#pragma pack(push, 1)
-struct PacketHeader {
-    int magic;       // 偏移 0, 4 字节
-    int cmd;         // 偏移 4, 4 字节
-    int body_len;    // 偏移 8, 4 字节
-};                   // 总大小 12 字节（无填充）
-#pragma pack(pop)
-
-// 柔性数组（Flexible Array Member）
-struct Packet {
-    PacketHeader header;  // 12 字节
-    char body[];          // 不占空间！实际大小由 malloc 决定
-};
-// 分配: malloc(sizeof(PacketHeader) + body_len)
-// body 指针指向 header 之后的内存区域
-```
-
-| 知识点 | 说明 |
-|--------|------|
-| **`#pragma pack`** | 控制结构体字节对齐方式；`push/pop` 保存/恢复原有对齐设置 |
-| **内存对齐** | 默认对齐下 `int` 需 4 字节边界，结构体可能有填充字节 |
-| **柔性数组** | C99/C++ 特性，`char body[]` 作为结构体最后一个成员，不占结构体空间，实现变长数据包 |
-| **二进制兼容** | 1 字节对齐保证不同编译器/平台下结构体二进制布局一致 |
-
-### 7.3 多线程编程
-
-```cpp
-// 临界区（轻量级同步对象）
-CRITICAL_SECTION g_cri_sec;
-InitializeCriticalSection(&g_cri_sec);
-EnterCriticalSection(&g_cri_sec);
-// ... 临界区代码 ...
-LeaveCriticalSection(&g_cri_sec);
-
-// 创建线程
-HANDLE h = CreateThread(
-    NULL,        // 安全属性
-    0,           // 栈大小（0 = 默认）
-    ThreadFunc,  // 线程函数
-    NULL,        // 参数
-    0,           // 创建标志（0 = 立即执行）
-    &thread_id   // 接收线程 ID
-);
-
-// 线程间消息通信
-PostThreadMessage(thread_id, WM_USER + 1, wParam, lParam);
-```
-
-| 知识点 | 说明 |
-|--------|------|
-| **CRITICAL_SECTION** | 用户态同步对象，比 Mutex 更轻量，适合进程内线程同步 |
-| **CreateThread** | Windows API 创建线程，返回句柄 |
-| **PostThreadMessage** | 向指定线程的消息队列投递消息，实现线程间异步通信 |
-| **线程消息队列** | Windows 线程在首次调用 `GetMessage`/`PeekMessage` 时才创建消息队列 |
-| **UI 线程限制** | 只有创建窗口的线程才能安全操作该窗口的 UI（单线程 GUI 模型） |
-
-### 7.4 Win32 GUI 编程
-
-```cpp
-// 窗口类注册
-WNDCLASS wc = { 0 };
-wc.lpfnWndProc = winProc;              // 消息处理函数
-wc.hInstance = hInstance;
-wc.lpszClassName = "MainWindow";
-wc.hbrBackground = (HBRUSH)GetStockObject(WHITE_BRUSH);
-wc.hCursor = LoadCursor(NULL, IDC_ARROW);
-wc.style = CS_HREDRAW | CS_VREDRAW;    // 尺寸变化时重绘
-RegisterClass(&wc);
-
-// 窗口创建
-HWND hwnd = CreateWindow("MainWindow", "远程控制",
-    WS_OVERLAPPEDWINDOW,
-    CW_USEDEFAULT, CW_USEDEFAULT,
-    800, 600, NULL, NULL, hInstance, NULL);
-
-// 消息循环
-MSG msg;
-while (GetMessage(&msg, NULL, 0, 0)) {
-    TranslateMessage(&msg);
-    DispatchMessage(&msg);
-}
-
-// 窗口过程
-LRESULT CALLBACK winProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    switch (msg) {
-    case WM_PAINT:       // 绘制
-    case WM_MOUSEMOVE:   // 鼠标移动
-    case WM_LBUTTONDOWN: // 左键按下
-    case WM_KEYDOWN:     // 键盘按下
-    // ...
-    }
-}
-```
-
-| 知识点 | 说明 |
-|--------|------|
-| **窗口类 (WNDCLASS)** | 定义窗口的"模板"，包括样式、图标、光标、消息处理函数等 |
-| **消息驱动模型** | Windows GUI 是事件驱动，所有操作由消息循环分发 |
-| **WM_PAINT** | 窗口需要重绘时发送；使用 `BeginPaint`/`EndPaint` 配对处理 |
-| **WM_MOUSEMOVE** | `lParam` 低字为 x，高字为 y；`LOWORD`/`HIWORD` 宏提取坐标 |
-| **虚拟键码** | 键盘消息中 `wParam` 是虚拟键码（`VK_RETURN`、`VK_SPACE` 等） |
-
-### 7.5 GDI 图形编程 — 屏幕捕获
-
-```cpp
-// 获取屏幕设备上下文
-HDC hScreen = GetDC(NULL);
-
-// 获取设备参数
-int bitWidth = GetDeviceCaps(hScreen, BITSPIXEL);  // 像素位宽
-int sWidth = GetSystemMetrics(SM_CXSCREEN);          // 屏幕宽度
-int sHeight = GetSystemMetrics(SM_CYSCREEN);          // 屏幕高度
-
-// 创建图像缓存
-CImage image;
-image.Create(sWidth, sHeight, bitWidth);
-
-// 屏幕像素复制
-BitBlt(
-    image.GetDC(),   // 目标 DC
-    0, 0,            // 目标左上角
-    sWidth, sHeight, // 目标宽高
-    hScreen,         // 源 DC
-    0, 0,            // 源左上角
-    SRCCOPY          // 操作类型：直接拷贝
-);
-
-// 释放资源
-image.ReleaseDC();
-ReleaseDC(NULL, hScreen);
-```
-
-| 知识点 | 说明 |
-|--------|------|
-| **设备上下文 (DC)** | Windows 的图形抽象层，所有绘制操作通过 DC 完成 |
-| **BitBlt** | 位图块传输（Bit Block Transfer），将像素矩形从源复制到目标 |
-| **SRCCOPY** | 光栅操作码，表示直接覆盖拷贝（不混合） |
-| **GetDC(NULL)** | 获取整个屏幕的 DC（NULL 表示桌面窗口） |
-| **DPI 感知** | `SetProcessDpiAwarenessContext` 使进程感知每个显示器的 DPI |
-
-### 7.6 CImage (ATL) 图像处理
-
-```cpp
-#include <atlimage.h>
-
-CImage image;
-
-// 从 DC 创建
-image.Create(width, height, bitWidth);
-
-// 保存到流（内存）
-IStream* pStream;
-CreateStreamOnHGlobal(hGlobal, TRUE, &pStream);
-image.Save(pStream, Gdiplus::ImageFormatPNG);  // PNG 编码
-
-// 从流加载
-image.Load(pStream);
-
-// 缩放绘制
-image.StretchBlt(hdc,
-    dstX, dstY, dstW, dstH,   // 目标矩形
-    srcX, srcY, srcW, srcH,   // 源矩形
-    SRCCOPY
-);
-
-// 获取图像信息
-int w = image.GetWidth();
-int h = image.GetHeight();
-BOOL isNull = image.IsNull();
-```
-
-| 知识点 | 说明 |
-|--------|------|
-| **CImage** | ATL 封装的图像类，支持 BMP/PNG/JPEG/GIF 等多种格式 |
-| **Gdiplus** | CImage 底层使用 GDI+ 进行 PNG 编解码 |
-| **StretchBlt** | 拉伸模式图像绘制，`HALFTONE` 模式实现高质量缩放 |
-| **`SetStretchBltMode`** | 设置拉伸质量：`HALFTONE`(高质量) / `COLORONCOLOR`(快速) |
-| **`SetBrushOrgEx`** | 配合 HALFTONE 模式使用，设置画刷对齐原点 |
-
-### 7.7 COM 接口 — IStream 内存流
-
-```cpp
-// 从堆分配可移动的全局内存块
-HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, 0);
-
-// 在全局内存上创建 COM 流对象
-IStream* pStream = NULL;
-CreateStreamOnHGlobal(hMem, TRUE, &pStream);  // TRUE = 自动释放 HGLOBAL
-
-// 写数据到流
-ULONG written;
-pStream->Write(data, dataSize, &written);
-
-// 重置流指针到开头
-LARGE_INTEGER pos = { 0 };
-pStream->Seek(pos, STREAM_SEEK_SET, NULL);
-
-// 直接访问流中数据
-char* ptr = (char*)GlobalLock(hMem);
-int size = GlobalSize(hMem);
-// ... 使用 ptr 和 size ...
-GlobalUnlock(hMem);
-
-// 释放流
-pStream->Release();
-```
-
-| 知识点 | 说明 |
-|--------|------|
-| **COM 接口** | `IStream` 是 COM（Component Object Model）接口，通过 `Release()` 管理引用计数 |
-| **HGLOBAL** | Windows 全局堆内存句柄，`GMEM_MOVEABLE` 表示内存可移动 |
-| **CreateStreamOnHGlobal** | 将 HGLOBAL 封装为 COM 流，方便与 CImage 等 COM 感知类互操作 |
-| **Seek** | 流指针定位，`STREAM_SEEK_SET` 从开头偏移 |
-
-### 7.8 鼠标/键盘模拟
-
-```cpp
-// 设置光标位置
-SetCursorPos(x, y);
-
-// 模拟鼠标事件
-mouse_event(MOUSEEVENTF_LEFTDOWN, 0, 0, 0, GetMessageExtraInfo());
-mouse_event(MOUSEEVENTF_LEFTUP,   0, 0, 0, GetMessageExtraInfo());
-mouse_event(MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, GetMessageExtraInfo());
-// 组合标志实现单击
-mouse_event(MOUSEEVENTF_LEFTDOWN | MOUSEEVENTF_LEFTUP, 0, 0, 0, GetMessageExtraInfo());
-
-// 模拟键盘事件（SendInput 是 mouse_event 的现代替代方案）
-INPUT input = { 0 };
-input.type = INPUT_KEYBOARD;
-input.ki.wVk = VK_RETURN;       // 虚拟键码
-input.ki.dwFlags = 0;            // 0=按下, KEYEVENTF_KEYUP=松开
-SendInput(1, &input, sizeof(INPUT));
-```
-
-| 知识点 | 说明 |
-|--------|------|
-| **`mouse_event`** | 已过时的 API，但简单场景仍广泛使用；现代代码推荐 `SendInput` |
-| **`SendInput`** | 向输入栈注入键盘/鼠标/硬件事件，比 `keybd_event`/`mouse_event` 更可靠 |
-| **`GetMessageExtraInfo`** | 返回当前消息的额外信息，模拟事件时作为参数传递以区分来源 |
-| **虚拟键码** | Windows 定义的键盘常量 `VK_*`，与具体键盘布局无关 |
-
-### 7.9 内存管理
-
-```cpp
-// C 标准库
-void* buf = malloc(size);
-free(buf);
-
-// Windows 全局堆
-HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, size);
-void* ptr = GlobalLock(hMem);
-// ... 使用 ptr ...
-GlobalUnlock(hMem);
-GlobalFree(hMem);
-
-// COM 内存
-CoTaskMemAlloc / CoTaskMemFree
-
-// C++ (未在项目中使用，但值得了解)
-void* buf = new char[size];
-delete[] buf;
-```
-
-### 7.10 预处理器指令
-
-```cpp
-#define _WINSOCK_DEPRECATED_NO_WARNINGS  // 消除 WinSock 废弃 API 警告
-#define RECV_BUFFER_SIZE 1024 * 1024 * 10  // 10MB 接收缓冲区
-
-#pragma comment(lib, "ws2_32.lib")       // 链接时自动引用库
-#pragma pack(push, 1)                    // 保存对齐设置，设置 1 字节对齐
-#pragma pack(pop)                        // 恢复之前的对齐设置
-```
-
----
-
-## 8. 构建与运行
-
-### 8.1 环境要求
-
-| 组件 | 要求 |
-|------|------|
-| 操作系统 | Windows 10/11 x64 |
-| 编译器 | Visual Studio 2022 (v143 工具集) |
-| Windows SDK | 10.0+ |
-| 依赖库 | `ws2_32.lib`（WinSock2）、ATL/MFC（CImage 依赖） |
-| 运行时 | VC++ 可再发行组件包 |
-
-### 8.2 构建步骤
-
-1. **打开解决方案**：双击 `RemoteControl.slnx` 在 Visual Studio 中打开。
-2. **选择配置**：Debug x64（调试）或 Release x64（发布）。
-3. **生成解决方案**：`生成 → 生成解决方案 (Ctrl+Shift+B)`。
-4. **编译产物**：
-   - 服务端：`RemoteControl/x64/Debug/RemoteControl.exe`
-   - 客户端：`client/x64/Debug/client.exe`
-
-### 8.3 运行步骤
-
-1. **启动服务端**（被控机器）：运行 `RemoteControl.exe`
-   ```
-   等待客户端连接...
-   客户端连接成功！
-   ```
-2. **启动客户端**（控制端机器）：运行 `client.exe`
-   - 弹出窗口 `"远程控制"`，实时显示被控端的桌面画面。
-   - 在窗口中进行鼠标操作（点击、拖动、滚动）和键盘输入，将实时转发到服务端执行。
-
-### 8.4 配置说明
-
-- **服务端 IP 地址**：目前硬编码为 `192.168.3.53`（[client.cpp L722](client/client.cpp#L722)），根据实际网络环境修改。
-- **服务端端口**：`9999`（[RemoteControl.cpp L506](RemoteControl/RemoteControl.cpp#L506)），如需修改请同时修改服务端和客户端。
-- **接收缓冲区**：`RECV_BUFFER_SIZE = 10 MB`，可按需调整。
-- **窗口大小**：客户端窗口默认 `800×600`，可拉伸缩放。
-
----
-
-## 9. 待优化项
-
-| 优先级 | 项目 | 说明 |
-|--------|------|------|
-| 高 | 错误处理 | `recv`/`send` 返回 ≤0 时应处理断连和错误恢复 |
-| 高 | IP 配置 | 硬编码 IP，建议改为命令行参数或配置文件 |
-| 高 | 内存泄漏 | 部分错误分支未释放已分配内存（如 `ParsePacket` 中 `body_len == 0` 分支） |
-| 中 | 鼠标移动频率 | `WM_MOUSEMOVE` 每个像素都发送，可增加节流（已注释的 500ms 逻辑） |
-| 中 | 加密传输 | 当前明文传输，局域网内部使用，公网场景应加 TLS |
-| 中 | 多客户端支持 | 服务端仅支持单客户端，可扩展为多客户端并发 |
-| 低 | 认证机制 | 无连接认证，任何知道端口的主机都可连接 |
-| 低 | 数据压缩 | PNG 已实现无损压缩，可考虑 JPEG/WebP 的有损压缩以减少带宽 |
-| 低 | 剪贴板同步 | 当前不支持剪贴板共享 |
-| 低 | 文件传输 | 当前不支持文件传输功能 |
-| 低 | 连接保活 | 无心跳机制，长连接断开检测不可靠 |
-
----
-
-## 知识索引
-
-本项目涉及的 C++/Windows 核心知识点速查：
-
-```
-┌─ 网络编程
-│  ├─ WinSock2 (WSAStartup/socket/connect/send/recv/accept/listen/bind)
-│  ├─ TCP 协议 (SOCK_STREAM)
-│  ├─ 网络字节序 (htons/ntohs)
-│  └─ inet_addr/INADDR_ANY
-├─ Win32 GUI
-│  ├─ WinMain 入口
-│  ├─ WNDCLASS/RegisterClass/CreateWindow
-│  ├─ 消息循环 (GetMessage/TranslateMessage/DispatchMessage)
-│  ├─ 窗口过程 (WM_PAINT/WM_MOUSEMOVE/WM_KEYDOWN...)
-│  └─ LOWORD/HIWORD 坐标提取
-├─ GDI 图形
-│  ├─ DC 设备上下文 (GetDC/ReleaseDC/BeginPaint/EndPaint)
-│  ├─ BitBlt 位块传输
-│  ├─ StretchBlt 拉伸绘制
-│  └─ SetStretchBltMode/SetBrushOrgEx
-├─ CImage (ATL)
-│  ├─ Create/Load/Save
-│  ├─ StretchBlt
-│  └─ GetWidth/GetHeight/IsNull
-├─ COM
-│  ├─ IStream 接口
-│  ├─ CreateStreamOnHGlobal
-│  ├─ HGLOBAL/GlobalAlloc/GlobalLock/GlobalUnlock
-│  └─ Release 引用计数
-├─ 多线程
-│  ├─ CreateThread
-│  ├─ CRITICAL_SECTION (Enter/Leave)
-│  ├─ PostThreadMessage 线程通信
-│  └─ 线程消息队列激活
-├─ 内存管理
-│  ├─ malloc/free
-│  ├─ memcpy/memmove
-│  └─ 柔性数组 (char body[])
-├─ 结构体对齐
-│  ├─ #pragma pack(push, 1) / #pragma pack(pop)
-│  └─ 内存对齐原理
-├─ 输入模拟
-│  ├─ SetCursorPos
-│  ├─ mouse_event (MOUSEEVENTF_*)
-│  └─ SendInput (INPUT/KEYBDINPUT)
-└─ 预处理器
-   ├─ #pragma comment(lib, ...)
-   ├─ #define 宏
-   └─ #pragma pack
-```
