@@ -185,7 +185,7 @@ bool FrameDecoder::Begin(const uint8_t* body, std::size_t len) {
     head_.tile_count = head.tile_count;
     head_.cursor_x = head.cursor_x;
     head_.cursor_y = head.cursor_y;
-    head_.cursor_visible = head.cursor_visible != 0;
+    head_.cursor_visible = head.cursor_visible != 0;  //从整数转成 bool（!= 0），因为协议里用 uint8_t 传布尔值。
     key_frame_ = head.key_frame != 0;
 
     tiles_ = body + sizeof(FrameHead);

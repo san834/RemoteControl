@@ -1,17 +1,18 @@
-# 统一换行：入库按 LF 存储，检出时按平台转换。
-* text=auto
+# 统一换行策略：入库、检出都按 LF。
+#
+# 为什么：Windows 上 core.autocrlf=true 会让 git 检出成 CRLF，而编辑器/工具新写的
+# 文件往往是 LF。两边一混就会出现"行尾不一致，是否标准化"的提示，diff 也会被
+# 整文件重写污染。统一成 LF 之后不再需要任何转换。
+* text=auto eol=lf
 
-# 源码
-*.cpp  text
-*.h    text
-*.txt  text
-*.md   text
-*.yml  text
-*.json text
-*.ps1  text eol=crlf
-
-# 二进制
+# 二进制，不参与换行转换
 *.png  binary
 *.gif  binary
+*.ico  binary
 *.exe  binary
 *.lib  binary
+*.pdb  binary
+
+# Windows 批处理必须是 CRLF：cmd.exe 对 LF 结尾的 .bat 处理不可靠
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
