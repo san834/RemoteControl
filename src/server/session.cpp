@@ -47,10 +47,14 @@ bool ServerSession::Handshake() {
     socket_.SetRecvTimeout(2000);
     const uint64_t deadline = NowMs() + 5000;
     Message message;
+    bool got_message = false;
     std::vector<uint8_t> buffer(16 * 1024);
 
     while (NowMs() < deadline) {
-        if (decoder_.Pop(message)) break;
+        if (decoder_.Pop(message)) {
+            got_message = true;
+            break;
+        }
         const int n = socket_.RecvSome(buffer.data(),
                                        static_cast<int>(buffer.size()));
         if (n > 0) {
@@ -65,6 +69,14 @@ bool ServerSession::Handshake() {
         if (err == WSAETIMEDOUT) continue;
         log::Warn("[%s] 握手失败: %s", peer_.c_str(),
                   net::LastErrorString(err).c_str());
+        return false;
+    }
+
+    // 循环是因为超时退出的（一个完整包都没收到）。这里必须单独判定：
+    // Message 的 cmd 有默认值 kHello，直接落到下面的命令检查会把"超时"
+    // 误报成"版本不匹配"，还会给一个没说过话的客户端发 Bye。
+    if (!got_message) {
+        log::Warn("[%s] 握手超时：5 秒内没有收到完整的 Hello", peer_.c_str());
         return false;
     }
 
